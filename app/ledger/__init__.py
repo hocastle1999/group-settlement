@@ -7,6 +7,8 @@ from app.ledger.errors import (
     InvalidAmountError,
     InvalidSplitError,
     LedgerError,
+    TooManyMembersError,
+    UnbalancedBalancesError,
     UnbalancedEntryError,
     UnknownMemberError,
 )
@@ -23,6 +25,13 @@ from app.ledger.ledger import (
     transfer_entry,
 )
 from app.ledger.money import CURRENCIES, Currency, Money, get_currency, sum_money
+from app.ledger.settle import (
+    Strategy,
+    Transfer,
+    greedy_transfers,
+    optimal_transfers,
+    settle,
+)
 from app.ledger.split import EqualSplit, FixedSplit, MemberId, RatioSplit, SplitRule, allocate
 
 __all__ = [
@@ -46,12 +55,19 @@ __all__ = [
     "RatioSplit",
     "Side",
     "SplitRule",
+    "Strategy",
+    "TooManyMembersError",
+    "Transfer",
+    "UnbalancedBalancesError",
     "UnbalancedEntryError",
     "UnknownMemberError",
     "allocate",
     "expense_entry",
     "get_currency",
+    "greedy_transfers",
+    "optimal_transfers",
     "reversal_of",
+    "settle",
     "sum_money",
     "total_balance",
     "transfer_entry",
