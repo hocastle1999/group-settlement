@@ -165,14 +165,16 @@ def record_transfer(
     actor: ActorDep = None,
 ) -> s.EntryOut:
     key = _require_key(idempotency_key)
+    # 지출과 같이 금액과 송금 규칙(자기 자신에게 송금 금지 등)은 그룹 잠금 전에 검사한다.
+    entry = transfer_entry(
+        member_key(body.sender_id),
+        member_key(body.receiver_id),
+        Money.of(body.amount, group.currency),
+        body.memo,
+    )
 
     def build(_conn, _seq):
-        return transfer_entry(
-            member_key(body.sender_id),
-            member_key(body.receiver_id),
-            Money.of(body.amount, group.currency),
-            body.memo,
-        )
+        return entry
 
     result = store.post_entry(
         engine, group, build, key, _request_hash(request, body), actor_id=actor
