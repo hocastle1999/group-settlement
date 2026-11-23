@@ -7,10 +7,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import errors
+from app.api.rate_limit import RateLimiter, client_ip, retry_after_header
 from app.api.routes import router
 from app.config import AppSettings
 from app.db.config import DatabaseSettings, create_db_engine
@@ -33,6 +34,41 @@ async def json_charset_utf8(request: Request, call_next):
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+def rate_limit_middleware(settings: AppSettings):
+    """POST만 센다. 그룹 만들기는 시간당, 나머지 쓰기는 분당 한도. 넘으면 429 + Retry-After.
+
+    async 미들웨어라 이벤트 루프 스레드 하나에서만 돈다. check() 안에 await가 없으므로
+    두 요청이 같은 deque를 동시에 고치는 일이 없다(락이 필요 없다).
+    """
+    groups = RateLimiter(settings.rate_limit_groups_per_hour, 3600)
+    writes = RateLimiter(settings.rate_limit_writes_per_minute, 60)
+
+    async def middleware(request: Request, call_next):
+        if request.method != "POST":
+            return await call_next(request)
+        if request.url.path == "/api/groups":
+            limiter = groups
+        else:
+            limiter = writes
+        if limiter.limit > 0:
+            ip = client_ip(
+                request.client.host if request.client else None,
+                request.headers.get("x-forwarded-for"),
+                settings.trusted_proxy_hops,
+            )
+            wait = limiter.check(ip)
+            if wait > 0:
+                return JSONResponse(
+                    {"error": "RateLimited", "detail": "요청이 너무 많다. 잠시 뒤 다시 시도하라"},
+                    status_code=429,
+                    headers={"Retry-After": retry_after_header(wait)},
+                    media_type="application/json; charset=utf-8",
+                )
+        return await call_next(request)
+
+    return middleware
+
+
 def create_app(
     db_settings: DatabaseSettings | None = None, settings: AppSettings | None = None
 ) -> FastAPI:
@@ -44,10 +80,12 @@ def create_app(
         yield
         engine.dispose()  # 종료할 때 연결 풀을 닫는다
 
+    settings = settings or AppSettings()
     app = FastAPI(title="group-settlement", lifespan=lifespan)
     app.middleware("http")(json_charset_utf8)
+    app.middleware("http")(rate_limit_middleware(settings))
     app.state.engine = engine
-    app.state.settings = settings or AppSettings()
+    app.state.settings = settings
     app.include_router(router)
     errors.install(app)
 

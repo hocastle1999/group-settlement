@@ -5,6 +5,10 @@ from pathlib import Path
 # 앱 모듈을 import하기 "전에" 테스트 DB를 정한다 (app.main은 import할 때 앱을 만든다).
 # 환경 변수는 .env보다 우선한다. 이름이 _test로 끝나는 DB만 쓴다 (아래 db_settings).
 os.environ["DB_NAME"] = os.environ.get("TEST_DB_NAME", "group_settlement_test")
+# 빈도 제한은 끈다. 한 테스트가 그룹을 여러 개 만들어도 엉뚱한 이유로 429가 나지 않게.
+# 빈도 제한 자체는 tests/test_rate_limit.py가 설정을 넣은 앱으로 따로 검사한다.
+os.environ["RATE_LIMIT_GROUPS_PER_HOUR"] = "0"
+os.environ["RATE_LIMIT_WRITES_PER_MINUTE"] = "0"
 
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
