@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -18,6 +18,8 @@ from app.ledger import CURRENCIES, EntryKind, Side, Strategy
 AmountStr = Annotated[str, StringConstraints(pattern=r"^\d{1,15}(\.\d{1,4})?$")]
 # 환율: 원래 통화 1단위당 기준 통화 단위. 정수 10자리, 소수 10자리까지 (그 이상은 자르지 않고 거부).
 RateStr = Annotated[str, StringConstraints(pattern=r"^\d{1,10}(\.\d{1,10})?$")]
+# UTC 차이. -12:00 ~ +14:00
+TzOffset = Annotated[str, StringConstraints(pattern=r"^[+-](0\d|1[0-4]):[0-5]\d$")]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 Memo = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
 CurrencyCode = Literal[tuple(sorted(CURRENCIES))]  # type: ignore[valid-type]
@@ -220,6 +222,39 @@ class AuditVerifyOut(BaseModel):
     events: int
     broken_at_seq: int | None
     reason: str | None
+
+
+class MemberSummaryOut(BaseModel):
+    member_id: int
+    name: str
+    paid: str  # 먼저 계산한 지출 합계
+    share: str  # 자기 몫으로 부담한 합계
+    sent: str  # 보낸 송금
+    received: str  # 받은 송금
+    balance: str  # paid - share + sent - received = 원장 잔액
+
+
+class DailySpendingOut(BaseModel):
+    day: date
+    expenses: int
+    total: str
+    cumulative: str
+
+
+class CurrencySpendingOut(BaseModel):
+    currency: str
+    expenses: int
+    original_total: str  # 원래 통화 금액
+    converted_total: str  # 그룹 기준 통화로 기록된 금액
+
+
+class ReportOut(BaseModel):
+    version: int  # 이 리포트가 반영한 원장 버전
+    currency: str
+    tz_offset: str
+    members: list[MemberSummaryOut]
+    daily: list[DailySpendingOut]
+    by_currency: list[CurrencySpendingOut]
 
 
 class ConfirmedSettlementList(BaseModel):

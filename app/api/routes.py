@@ -23,7 +23,7 @@ from app.api.auth import (
     hash_token,
     new_invite_token,
 )
-from app.db import audit, store
+from app.db import audit, report, store
 from app.db.store import Group, PostResult, StoredEntry, member_key
 from app.ledger import (
     Currency,
@@ -327,6 +327,54 @@ def get_confirmed_settlement(
 ) -> s.ConfirmedSettlementOut:
     settlement = store.get_settlement(engine, group, settlement_id)
     return _confirmed_out(group, settlement, store.current_version(engine, group))
+
+
+# ---------------------------------------------------------------- 리포트
+
+
+@router.get("/groups/{group_id}/report", response_model=s.ReportOut)
+def get_report(
+    group: CurrentGroup,
+    engine: EngineDep,
+    tz_offset: Annotated[s.TzOffset, Query()] = "+00:00",
+) -> s.ReportOut:
+    """멤버별 요약, 날짜별 지출과 누적, 통화별 지출. 세 쿼리를 같은 스냅숏에서 읽는다."""
+    r = report.build_report(engine, group, tz_offset)
+    return s.ReportOut(
+        version=r.version,
+        currency=group.currency.code,
+        tz_offset=tz_offset,
+        members=[
+            s.MemberSummaryOut(
+                member_id=m.member_id,
+                name=m.name,
+                paid=str(m.paid.amount),
+                share=str(m.share.amount),
+                sent=str(m.sent.amount),
+                received=str(m.received.amount),
+                balance=str(m.balance.amount),
+            )
+            for m in r.members
+        ],
+        daily=[
+            s.DailySpendingOut(
+                day=d.day,
+                expenses=d.expenses,
+                total=str(d.total.amount),
+                cumulative=str(d.cumulative.amount),
+            )
+            for d in r.daily
+        ],
+        by_currency=[
+            s.CurrencySpendingOut(
+                currency=c.currency,
+                expenses=c.expenses,
+                original_total=str(c.original_total.amount),
+                converted_total=str(c.converted_total.amount),
+            )
+            for c in r.by_currency
+        ],
+    )
 
 
 # ---------------------------------------------------------------- 감사 로그
