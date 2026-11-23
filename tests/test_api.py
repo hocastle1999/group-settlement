@@ -159,6 +159,17 @@ def test_entries_are_listed_newest_first_with_cursor(client):
 # ---------------------------------------------------------------- 인증 (초대 토큰)
 
 
+def test_json_responses_declare_utf8(client):
+    """PowerShell 5.1은 charset이 없으면 한글 응답을 ISO-8859-1로 읽는다. 오류 응답도 포함."""
+    gid, headers, _ = create_group(client)
+    ok = client.get(f"/api/groups/{gid}", headers=headers)
+    unauthorized = client.get(f"/api/groups/{gid}")
+    invalid = client.post("/api/groups", json={"name": "x", "currency": "BTC"})
+    for res in (ok, unauthorized, invalid):
+        assert res.headers["content-type"] == "application/json; charset=utf-8"
+    assert ok.json()["members"][0]["name"] == "민수"
+
+
 def test_missing_token_is_401(client):
     gid, _, _ = create_group(client)
     res = client.get(f"/api/groups/{gid}/balances")

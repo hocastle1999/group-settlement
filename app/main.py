@@ -5,11 +5,25 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from app.api import errors
 from app.api.routes import router
 from app.db.config import DatabaseSettings, create_db_engine
+
+
+async def json_charset_utf8(request: Request, call_next):
+    """JSON 응답의 Content-Type에 charset을 붙인다: application/json; charset=utf-8
+
+    JSON은 표준상(RFC 8259) UTF-8뿐이라 charset이 없어도 되고 Starlette도 붙이지 않는다.
+    그런데 Windows PowerShell 5.1의 Invoke-RestMethod는 charset이 없으면 응답을 ISO-8859-1로
+    읽어 한글이 깨진다 (docs/troubleshooting.md). 오류 응답(422, 401, 404)까지 한 곳에서 처리하려고
+    응답 클래스가 아니라 미들웨어로 고친다.
+    """
+    response = await call_next(request)
+    if response.headers.get("content-type") == "application/json":
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
 
 
 def create_app(db_settings: DatabaseSettings | None = None) -> FastAPI:
@@ -22,6 +36,7 @@ def create_app(db_settings: DatabaseSettings | None = None) -> FastAPI:
         engine.dispose()  # 종료할 때 연결 풀을 닫는다
 
     app = FastAPI(title="group-settlement", lifespan=lifespan)
+    app.middleware("http")(json_charset_utf8)
     app.state.engine = engine
     app.include_router(router)
     errors.install(app)
