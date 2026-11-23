@@ -28,14 +28,19 @@ class Currency:
         return Decimal(1).scaleb(-self.exponent)
 
 
-# 지원 통화. 다중 통화(5단계)에서 늘린다.
+# 지원 통화 (ISO 4217 minor unit). 5단계에서 늘렸다. 바꾸면 DB의 통화 CHECK도 마이그레이션해야 한다.
 CURRENCIES: dict[str, Currency] = {
     c.code: c
     for c in (
         Currency("KRW", 0),
         Currency("JPY", 0),
+        Currency("VND", 0),
         Currency("USD", 2),
         Currency("EUR", 2),
+        Currency("GBP", 2),
+        Currency("CNY", 2),
+        Currency("THB", 2),
+        Currency("KWD", 3),  # 소수 3자리 통화 (1 디나르 = 1000 필스)
     )
 }
 

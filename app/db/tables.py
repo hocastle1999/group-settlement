@@ -49,6 +49,8 @@ def _in(column: str, values: list[str]) -> str:
 # 다중 통화(5단계)에서 소수 3자리 통화(BHD 등)와 환산 금액을 담을 여유를 둔다.
 # float/double은 쓰지 않는다 (0.1을 정확히 저장할 수 없다).
 AMOUNT = Numeric(19, 4)
+# 환율 열. 정수 10자리 + 소수 10자리 (app/ledger/fx.py의 RATE_MAX_* 와 같다).
+FX_RATE = Numeric(20, 10)
 
 # ENUM 대신 VARCHAR + CHECK: MySQL ENUM은 값을 추가할 때 ALTER TABLE이 필요하고 내부적으로
 # 순번으로 정렬되는 등 헷갈린다. CHECK는 MySQL 8.0.16부터 실제로 검사한다.
@@ -103,6 +105,11 @@ journal_entries = Table(
     # REVERSAL이면 취소하는 분개 id. 유니크라서 한 분개는 한 번만 취소된다.
     # (MySQL 유니크 인덱스는 NULL을 여러 개 허용한다 -> 일반 분개는 모두 NULL이어도 된다)
     Column("reverses_entry_id", BigInteger, nullable=True),
+    # 외화 지출의 증빙 (5단계). 줄(entry_lines)은 모두 그룹 기준 통화로 환산된 금액이다.
+    # 환율 = 원래 통화 1단위당 기준 통화 단위. 셋 다 있거나 셋 다 없다.
+    Column("original_currency", String(3), nullable=True),
+    Column("original_amount", AMOUNT, nullable=True),
+    Column("fx_rate", FX_RATE, nullable=True),
     Column("created_at", DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     ForeignKeyConstraint(["group_id"], ["settlement_groups.id"]),
     UniqueConstraint("group_id", "id"),
@@ -117,6 +124,16 @@ journal_entries = Table(
     CheckConstraint(
         "(kind = 'REVERSAL') = (reverses_entry_id IS NOT NULL)", name="reversal_has_target"
     ),
+    # CHECK에서 NULL은 "알 수 없음"이라 통과한다. 그래서 값이 있을 때의 규칙만 쓰면 된다.
+    CheckConstraint(_in("original_currency", CURRENCY_CODES), name="original_currency"),
+    CheckConstraint("original_amount > 0", name="original_amount_positive"),
+    CheckConstraint("fx_rate > 0", name="fx_rate_positive"),
+    CheckConstraint(
+        "(original_currency IS NULL) = (original_amount IS NULL)"
+        " AND (original_amount IS NULL) = (fx_rate IS NULL)",
+        name="fx_all_or_none",
+    ),
+    CheckConstraint("original_currency IS NULL OR kind = 'EXPENSE'", name="fx_only_expense"),
 )
 
 entry_lines = Table(

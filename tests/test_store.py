@@ -9,17 +9,19 @@
 from __future__ import annotations
 
 import random
+import re
 import threading
 import time
 
 import pytest
-from sqlalchemy import Engine, func, insert, select
+from sqlalchemy import Engine, func, insert, select, text
 from sqlalchemy.exc import DBAPIError
 
 from app.db import store
 from app.db.store import DuplicateMemberError, Group, IdempotencyKeyReusedError, member_key
 from app.db.tables import entry_lines, idempotency_keys, journal_entries, members
 from app.ledger import (
+    CURRENCIES,
     AlreadyReversedError,
     EntryNotFoundError,
     EqualSplit,
@@ -363,3 +365,42 @@ def test_concurrent_requests_with_same_key_create_one_entry(db):
     assert count(db, journal_entries) == 1
     assert count(db, entry_lines) == 2
     assert len(built) == 1  # 분개를 만든 것은 처음 요청 하나뿐
+
+
+# ---------------------------------------------------------------- 다중 통화 (5단계)
+
+
+@pytest.mark.parametrize(
+    "constraint", ["ck_settlement_groups_currency", "ck_journal_entries_original_currency"]
+)
+def test_db_currency_checks_match_app_currencies(db, constraint):
+    """alembic check는 CHECK 내용을 비교하지 않는다.
+    통화를 늘리고 마이그레이션을 빠뜨리면 여기서 잡는다."""
+    with db.connect() as conn:
+        clause = conn.execute(
+            text(
+                "SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS"
+                " WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = :name"
+            ),
+            {"name": constraint},
+        ).scalar_one()
+    # MySQL이 저장한 식은 소문자로 바뀐다: (`currency` in (_utf8mb4'CNY',...)).
+    # 그래서 대문자 세 글자는 통화 코드뿐이다.
+    assert set(re.findall(r"[A-Z]{3}", clause)) == set(CURRENCIES)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"original_currency": "USD"},  # 셋 중 하나만
+        {"original_currency": "USD", "original_amount": 10, "fx_rate": 0},  # 환율 0
+        {"original_currency": "XXX", "original_amount": 10, "fx_rate": 1},  # 모르는 통화
+        {"kind": "TRANSFER", "original_currency": "USD", "original_amount": 10, "fx_rate": 1},
+    ],
+)
+def test_db_rejects_inconsistent_fx_columns(db, values):
+    group, _ = make_group(db)
+    values = {"kind": "EXPENSE", **values}
+    with pytest.raises(DBAPIError) as info:
+        _raw_entry(db, group.id, **values)
+    assert _error_code(info.value) == ER_CHECK_CONSTRAINT_VIOLATED
