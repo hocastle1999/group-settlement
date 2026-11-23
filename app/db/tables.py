@@ -65,10 +65,14 @@ settlement_groups = Table(
     Column("currency", String(3), nullable=False),
     # 초대 토큰의 SHA-256 해시(32바이트). 토큰 원문은 저장하지 않는다 (app/api/auth.py).
     Column("invite_token_hash", BINARY(32), nullable=False),
+    # 이 그룹의 마지막 분개 순번 = 원장 버전. 분개를 쓰는 트랜잭션은 이 행을 FOR UPDATE로 잠그고
+    # 1 늘린다. 그래서 같은 그룹의 쓰기는 한 줄로 서고, 순번 순서가 곧 커밋 순서가 된다 (store.py).
+    Column("last_seq", BigInteger, nullable=False, server_default="0"),
     Column("created_at", DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     UniqueConstraint("invite_token_hash"),
     CheckConstraint(_in("currency", CURRENCY_CODES), name="currency"),
     CheckConstraint("name <> ''", name="name_not_empty"),
+    CheckConstraint("last_seq >= 0", name="last_seq_not_negative"),
 )
 
 members = Table(
@@ -91,6 +95,9 @@ journal_entries = Table(
     metadata,
     Column("id", BigInteger, primary_key=True, autoincrement=True),
     Column("group_id", BigInteger, nullable=False),
+    # 그룹 안 순번 (1, 2, 3, ... 빈 번호 없음). id(AUTO_INCREMENT)는 "번호를 받은 순서"일 뿐
+    # 커밋 순서가 아니어서 원장 버전으로 쓸 수 없다 (docs/design.md 4단계).
+    Column("seq", BigInteger, nullable=False),
     Column("kind", String(16), nullable=False),
     Column("memo", String(200), nullable=False, server_default=""),
     # REVERSAL이면 취소하는 분개 id. 유니크라서 한 분개는 한 번만 취소된다.
@@ -99,7 +106,9 @@ journal_entries = Table(
     Column("created_at", DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     ForeignKeyConstraint(["group_id"], ["settlement_groups.id"]),
     UniqueConstraint("group_id", "id"),
+    UniqueConstraint("group_id", "seq"),
     UniqueConstraint("reverses_entry_id"),
+    CheckConstraint("seq > 0", name="seq_positive"),
     # 같은 그룹의 분개만 취소할 수 있다. reverses_entry_id가 NULL이면 검사하지 않는다(MATCH SIMPLE).
     ForeignKeyConstraint(
         ["group_id", "reverses_entry_id"], ["journal_entries.group_id", "journal_entries.id"]

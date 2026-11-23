@@ -267,6 +267,7 @@ def _entry_response(result: PostResult, response: Response) -> s.EntryOut:
 def _entry_out(entry: StoredEntry) -> s.EntryOut:
     return s.EntryOut(
         id=entry.id,
+        seq=entry.seq,
         kind=entry.kind,
         memo=entry.memo,
         reverses_entry_id=entry.reverses_entry_id,

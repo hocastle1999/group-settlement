@@ -115,6 +115,7 @@ class LineOut(BaseModel):
 
 class EntryOut(BaseModel):
     id: int
+    seq: int  # 그룹 안 순번 (1, 2, 3, ...)
     kind: EntryKind
     memo: str
     reverses_entry_id: int | None

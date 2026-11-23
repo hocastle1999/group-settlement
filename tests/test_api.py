@@ -145,6 +145,7 @@ def test_entries_are_listed_newest_first_with_cursor(client):
 
     page1 = client.get(f"/api/groups/{gid}/entries?limit=2", headers=headers).json()
     assert [e["id"] for e in page1["entries"]] == created[::-1][:2]
+    assert [e["seq"] for e in page1["entries"]] == [5, 4]  # 그룹 안 순번
     cursor = page1["next_before_id"]
     page2 = client.get(f"/api/groups/{gid}/entries?limit=2&before_id={cursor}", headers=headers)
     page3 = client.get(
@@ -337,7 +338,7 @@ def test_unbalanced_ledger_is_500_without_details(client, monkeypatch):
 
 
 def test_app_never_updates_or_deletes_ledger_rows(client, db):
-    """전체 흐름에서 앱이 보내는 SQL을 모두 보고, UPDATE/DELETE가 하나도 없는지 확인한다."""
+    """전체 흐름에서 앱이 보내는 SQL을 모두 보고, 원장 테이블에 UPDATE/DELETE가 없는지 확인한다."""
     statements: list[str] = []
 
     def record(conn, cursor, statement, parameters, context, executemany):
@@ -357,4 +358,7 @@ def test_app_never_updates_or_deletes_ledger_rows(client, db):
         event.remove(db, "before_cursor_execute", record)
 
     assert any(s.startswith("INSERT INTO JOURNAL_ENTRIES") for s in statements)
-    assert not [s for s in statements if s.startswith(("UPDATE", "DELETE"))]
+    writes = [s for s in statements if s.startswith(("UPDATE", "DELETE"))]
+    # 원장 버전(그룹 행의 last_seq)만 늘린다. 분개, 줄, 멱등성 키는 INSERT만 한다.
+    assert writes
+    assert all(s.startswith("UPDATE SETTLEMENT_GROUPS SET LAST_SEQ") for s in writes), writes

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 
 import pytest
 from sqlalchemy import Engine, func, insert, select
@@ -175,7 +176,11 @@ def test_concurrent_reversal_is_stopped_by_unique_constraint(db, monkeypatch):
 # ---------------------------------------------------------------- DB 제약 (코어를 거치지 않은 쓰기)
 
 
+_raw_seq = iter(range(1, 1_000_000))
+
+
 def _raw_entry(db: Engine, group_id: int, **values) -> int:
+    values.setdefault("seq", next(_raw_seq))
     with db.begin() as conn:
         result = conn.execute(insert(journal_entries).values(group_id=group_id, **values))
         return int(result.inserted_primary_key[0])
@@ -323,20 +328,25 @@ def test_keys_are_scoped_per_group_and_case_sensitive(db):
 def test_concurrent_requests_with_same_key_create_one_entry(db):
     """같은 키의 요청 여러 개가 동시에 들어와도 분개는 하나. 늦은 요청은 첫 결과를 받는다.
 
-    모든 스레드가 "키 없음"을 확인한 뒤 함께 쓰기 시작하도록 분개를 만드는 시점에 장벽을 둔다.
+    모든 스레드가 함께 출발해 "키 없음"(잠금 없는 빠른 확인)을 통과하게 하고, 그룹 잠금을 먼저 잡은
+    요청이 분개를 만드는 동안 잠시 머물게 한다. 나머지는 잠금에서 기다렸다가, 잠금을 얻은 뒤의
+    재확인에서 먼저 커밋된 키를 보고 처음 결과를 돌려받아야 한다.
     """
     group, ids = make_group(db)
     entry = transfer_entry(m(ids, "a"), m(ids, "b"), krw(1_000))
     n = 4
-    barrier = threading.Barrier(n)
+    start = threading.Barrier(n)
     results, errors = [], []
+    built = []
 
     def build(_conn):
-        barrier.wait(timeout=10)
+        built.append(1)
+        time.sleep(0.3)  # 다른 요청들이 빠른 확인을 지나 잠금에서 기다리게 한다
         return entry
 
     def worker():
         try:
+            start.wait(timeout=10)
             results.append(store.post_entry(db, group, build, "dup", store.hash_bytes(b"same")))
         except Exception as exc:  # pragma: no cover - 실패 시 원인 표시용
             errors.append(exc)
@@ -352,3 +362,4 @@ def test_concurrent_requests_with_same_key_create_one_entry(db):
     assert sum(not r.replayed for r in results) == 1
     assert count(db, journal_entries) == 1
     assert count(db, entry_lines) == 2
+    assert len(built) == 1  # 분개를 만든 것은 처음 요청 하나뿐

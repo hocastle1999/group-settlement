@@ -22,7 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import Connection, Engine, case, func, select
+from sqlalchemy import Connection, Engine, case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db.tables import (
@@ -95,6 +95,7 @@ class StoredLine:
 @dataclass(frozen=True, slots=True)
 class StoredEntry:
     id: int
+    seq: int  # 그룹 안 순번 (1부터, 빈 번호 없음)
     kind: EntryKind
     memo: str
     reverses_entry_id: int | None
@@ -187,21 +188,33 @@ def post_entry(
 ) -> PostResult:
     """분개 하나를 검사하고 기록한다. 같은 멱등성 키로 다시 오면 처음 결과를 돌려준다.
 
-    멱등성 키 INSERT를 분개 INSERT와 같은 트랜잭션에 넣는다:
-    - 키가 이미 있으면(재시도) 키 INSERT가 유니크 위반으로 실패 -> 분개까지 롤백 -> 이전 결과 반환.
-    - 같은 키로 동시에 두 요청이 오면, 늦은 쪽은 키 INSERT에서 먼저 온 트랜잭션이 끝나기를 기다린다
-      (InnoDB 행 잠금). 먼저 온 쪽이 커밋하면 유니크 위반 -> 롤백 -> 이전 결과 반환.
-    그래서 "키 선점 -> 처리 -> 결과 UPDATE" 같은 상태 관리 없이 중복 분개가 생기지 않는다.
+    한 트랜잭션 안에서:
+    1. 그룹 행을 잠근다(`lock_group`). 같은 그룹의 쓰기는 여기서 한 줄로 선다.
+    2. 잠금을 기다리는 사이 같은 키의 요청이 먼저 커밋됐는지 다시 본다 -> 있으면 그 결과를 돌려준다.
+    3. 분개를 만들고(코어) 검사하고 순번 last_seq + 1로 INSERT, last_seq를 1 늘린다.
+    4. 멱등성 키를 INSERT한다. 커밋하면 잠금이 풀린다.
+    키 INSERT의 유니크 위반은 잠금을 거치지 않는 경로를 위한 마지막 방어선으로 남겨 둔다.
     """
-    # 흔한 재시도는 여기서 끝난다 (분개를 만들어 보지도 않고 반환).
-    replay = _replay(engine, group.id, idempotency_key, request_hash)
+    # 흔한 재시도는 잠금 없이 여기서 끝난다.
+    with engine.connect() as conn:
+        replay = _find_replay(conn, group.id, idempotency_key, request_hash)
     if replay is not None:
         return replay
 
     try:
         with engine.begin() as conn:
+            last_seq = lock_group(conn, group.id)
+            replay = _find_replay(conn, group.id, idempotency_key, request_hash)
+            if replay is not None:
+                return replay
             entry = build(conn)
-            entry_id = _insert_checked(conn, group, entry)
+            seq = last_seq + 1
+            entry_id = _insert_checked(conn, group, entry, seq)
+            conn.execute(
+                update(settlement_groups)
+                .where(settlement_groups.c.id == group.id)
+                .values(last_seq=seq)
+            )
             try:
                 conn.execute(
                     idempotency_keys.insert().values(
@@ -218,33 +231,52 @@ def post_entry(
             stored = _load_entries(conn, group.id, [entry_id])[0]
     except _KeyAlreadyUsed:
         # 위 트랜잭션은 롤백됐다(분개도 없음). 먼저 커밋된 요청의 결과를 새 연결로 읽는다.
-        replay = _replay(engine, group.id, idempotency_key, request_hash)
+        with engine.connect() as conn:
+            replay = _find_replay(conn, group.id, idempotency_key, request_hash)
         assert replay is not None
         return replay
     return PostResult(stored, replayed=False)
+
+
+def lock_group(conn: Connection, group_id: int) -> int:
+    """그룹 행을 배타 잠금(SELECT ... FOR UPDATE)하고 지금 원장 버전(last_seq)을 돌려준다.
+
+    잠금은 트랜잭션이 끝날 때(커밋, 롤백) 풀린다. 다른 그룹의 쓰기는 막지 않는다(행 잠금).
+
+    반드시 트랜잭션의 첫 쿼리로 부른다. MySQL 기본 격리 수준(REPEATABLE READ)에서 일반 SELECT는
+    트랜잭션의 "첫 일반 읽기" 시점 스냅숏을 계속 본다. 잠금보다 먼저 일반 SELECT를 하면, 잠금을
+    기다리는 동안 다른 트랜잭션이 커밋한 분개가 그 뒤의 읽기에서 보이지 않는다.
+    (FOR UPDATE 자체는 잠금 읽기라 스냅숏이 아니라 최신 커밋 값을 읽는다)
+    """
+    return conn.execute(
+        select(settlement_groups.c.last_seq)
+        .where(settlement_groups.c.id == group_id)
+        .with_for_update()
+    ).scalar_one()
 
 
 class _KeyAlreadyUsed(Exception):
     """멱등성 키가 다른 트랜잭션에서 이미 커밋됐다 (내부 신호)."""
 
 
-def _replay(engine: Engine, group_id: int, key: str, request_hash: bytes) -> PostResult | None:
-    with engine.connect() as conn:
-        row = conn.execute(
-            select(idempotency_keys.c.request_hash, idempotency_keys.c.entry_id).where(
-                idempotency_keys.c.group_id == group_id,
-                idempotency_keys.c.idem_key == key,
-            )
-        ).one_or_none()
-        if row is None:
-            return None
-        if row.request_hash != request_hash:
-            # 같은 키로 다른 내용을 보냈다. 이전 결과를 주면 클라이언트는 새 요청이 처리된 줄 안다.
-            raise IdempotencyKeyReusedError(f"멱등성 키 {key!r}는 다른 요청에 이미 쓰였다")
-        return PostResult(_load_entries(conn, group_id, [row.entry_id])[0], replayed=True)
+def _find_replay(
+    conn: Connection, group_id: int, key: str, request_hash: bytes
+) -> PostResult | None:
+    row = conn.execute(
+        select(idempotency_keys.c.request_hash, idempotency_keys.c.entry_id).where(
+            idempotency_keys.c.group_id == group_id,
+            idempotency_keys.c.idem_key == key,
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if row.request_hash != request_hash:
+        # 같은 키로 다른 내용을 보냈다. 이전 결과를 주면 클라이언트는 새 요청이 처리된 줄 안다.
+        raise IdempotencyKeyReusedError(f"멱등성 키 {key!r}는 다른 요청에 이미 쓰였다")
+    return PostResult(_load_entries(conn, group_id, [row.entry_id])[0], replayed=True)
 
 
-def _insert_checked(conn: Connection, group: Group, entry: JournalEntry) -> int:
+def _insert_checked(conn: Connection, group: Group, entry: JournalEntry, seq: int) -> int:
     member_ids = [member_key(m.id) for m in list_members(conn, group.id)]
     check_postable(entry, group.currency, member_ids)
     if entry.kind is EntryKind.REVERSAL:
@@ -256,6 +288,7 @@ def _insert_checked(conn: Connection, group: Group, entry: JournalEntry) -> int:
         result = conn.execute(
             journal_entries.insert().values(
                 group_id=group.id,
+                seq=seq,
                 kind=entry.kind.value,
                 memo=entry.memo,
                 reverses_entry_id=entry.reverses,
@@ -348,6 +381,7 @@ def _load_entries(conn: Connection, group_id: int, ids: Sequence[int]) -> list[S
     heads = conn.execute(
         select(
             journal_entries.c.id,
+            journal_entries.c.seq,
             journal_entries.c.kind,
             journal_entries.c.memo,
             journal_entries.c.reverses_entry_id,
@@ -373,6 +407,7 @@ def _load_entries(conn: Connection, group_id: int, ids: Sequence[int]) -> list[S
     by_id = {
         h.id: StoredEntry(
             id=h.id,
+            seq=h.seq,
             kind=EntryKind(h.kind),
             memo=h.memo,
             reverses_entry_id=h.reverses_entry_id,
@@ -395,7 +430,33 @@ def _group_currency(conn: Connection, group_id: int) -> Currency:
 # ---------------------------------------------------------------- 잔액
 
 
+@dataclass(frozen=True, slots=True)
+class LedgerSnapshot:
+    """한 시점의 원장: 버전(그 시점까지 기록된 마지막 순번)과 그 버전의 잔액."""
+
+    version: int
+    balances: dict[int, Money]
+
+
+def snapshot(engine: Engine, group: Group) -> LedgerSnapshot:
+    """버전과 잔액을 같은 트랜잭션에서 읽는다.
+
+    REPEATABLE READ에서는 한 트랜잭션의 일반 SELECT가 모두 같은 스냅숏을 본다. 그래서 두 쿼리
+    사이에 다른 분개가 커밋돼도 "버전 N과 버전 N+1의 잔액"처럼 어긋난 짝이 나오지 않는다.
+    """
+    with engine.connect() as conn:
+        version = conn.execute(
+            select(settlement_groups.c.last_seq).where(settlement_groups.c.id == group.id)
+        ).scalar_one()
+        return LedgerSnapshot(version, group_balances(conn, group))
+
+
 def balances(engine: Engine, group: Group) -> dict[int, Money]:
+    with engine.connect() as conn:
+        return group_balances(conn, group)
+
+
+def group_balances(conn: Connection, group: Group) -> dict[int, Money]:
     """멤버별 잔액(대변 합 - 차변 합)을 SQL SUM으로 구한다. 기록이 없는 멤버는 0.
 
     LEFT JOIN이라 줄이 없는 멤버도 나온다. 합이 0이 아니면 원장이 깨진 것이므로 예외를 낸다.
@@ -417,8 +478,7 @@ def balances(engine: Engine, group: Group) -> dict[int, Money]:
         .group_by(members.c.id)
         .order_by(members.c.id)
     )
-    with engine.connect() as conn:
-        result = {row.id: Money.of(row.balance, group.currency) for row in conn.execute(query)}
+    result = {row.id: Money.of(row.balance, group.currency) for row in conn.execute(query)}
     total = total_balance({member_key(m): v for m, v in result.items()}, group.currency)
     if not total.is_zero():
         raise UnbalancedBalancesError(f"그룹 {group.id}의 잔액 합이 0이 아니다: {total}")
