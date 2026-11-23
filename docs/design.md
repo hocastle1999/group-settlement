@@ -70,7 +70,7 @@ DB에서 `CHECK (amount > 0)`로 잘못된 값을 막을 수 있고, 회계 용�
 - 한 분개는 한 번만 취소할 수 있고, 역분개 자체는 취소할 수 없다. 다시 필요하면 원래 거래를 새로 기록한다.
 - 검사에 실패하면 원장은 바뀌지 않는다.
 
-잔액은 매번 모든 분개를 다시 더해서 구한다. 잔액을 따로 저장하는 방식과의 비교(정합성 vs 조회 속도)는 4단계에서 한다.
+잔액은 매번 모든 분개를 다시 더해서 구한다. 잔액을 따로 저장하는 방식과의 비교는 4단계에서 했고, 커버링 인덱스 + SUM을 유지하기로 했다([실험](experiments.md#4단계-잔액-계산-방식과-동시성)).
 
 ### 테스트 (1단계)
 
@@ -221,8 +221,8 @@ GROUP BY m.id
 
 - LEFT JOIN이라 기록이 없는 멤버도 0으로 나온다.
 - 결과를 `Money`로 바꾼 뒤 합이 0인지 확인한다. 0이 아니면 `UnbalancedBalancesError`(500). 원장이 깨진 것은 클라이언트 잘못이 아니다.
-- `EXPLAIN`(그룹 3개 x 분개 1,500개, 한 그룹 6,000줄): `members`는 `uq_members_group_id_id`로 커버링 조회, `entry_lines`는 `ix_entry_lines_group_id_member_id`로 멤버마다 조회, 약 5ms. `side`, `amount`는 기본키로 다시 읽는다(커버링 아님). 줄이 2개뿐일 때는 옵티마이저가 기본키 앞부분을 골랐다. 데이터가 적을 때의 EXPLAIN은 믿지 않는다.
-- 커버링 인덱스, 잔액 테이블과의 비교(정합성 vs 조회 속도)는 4단계에서 한다.
+- 3단계 `EXPLAIN`(그룹 3개 x 분개 1,500개, 한 그룹 6,000줄): `entry_lines`는 `ix_entry_lines_group_id_member_id`로 멤버마다 조회, 약 5ms. `side`, `amount`는 기본키로 다시 읽었다(커버링 아님). 4단계에서 커버링 인덱스 `(group_id, member_id, side, amount)`로 바꿨다(`Using index`). 줄이 2개뿐일 때는 옵티마이저가 기본키 앞부분을 골랐다. 데이터가 적을 때의 EXPLAIN은 믿지 않는다.
+- 커버링 인덱스, 잔액 테이블과의 비교는 4단계 "잔액 계산 방식".
 - `test_sql_balances_match_in_memory_ledger`: 같은 무작위 거래(지출 3종, 송금, 취소 40번)를 DB와 메모리 `Ledger`에 넣고 매 단계 잔액이 같은지 비교한다.
 
 ### 인증: 초대 링크 토큰
@@ -304,7 +304,9 @@ sequenceDiagram
 | POST | `/api/groups/{id}/entries/{entry_id}/reversal` | 취소(역분개) |
 | GET | `/api/groups/{id}/entries?limit&before_id` | 최신순 분개. 키셋 페이지네이션(`next_before_id`) |
 | GET | `/api/groups/{id}/balances` | 멤버별 잔액 |
-| GET | `/api/groups/{id}/settlement?strategy=auto` | 정산 송금 목록(계산만, 기록하지 않음) |
+| GET | `/api/groups/{id}/settlement?strategy=auto` | 정산 송금 목록(계산만, 기록하지 않음). 4단계부터 원장 `version` 포함 |
+| POST | `/api/groups/{id}/settlements` | 정산 확정 `{expected_version, strategy}`. 버전이 바뀌었으면 409 (4단계) |
+| GET | `/api/groups/{id}/settlements`, `/settlements/{settlement_id}` | 확정 기록. `current_version`으로 확정 뒤 변화 여부 표시 (4단계) |
 
 - 금액은 JSON **문자열**("12.34")로만 주고받는다. JSON 숫자는 대부분의 파서가 double로 읽어 서버에 오기 전에 오차가 생길 수 있으므로 거부한다(422).
 - 요청 모델은 모르는 필드를 거부한다(`extra="forbid"`).
@@ -332,3 +334,103 @@ sequenceDiagram
 - DB 제약 직접 검사: 코어를 거치지 않고 SQL로 금액 0, 잘못된 side, 다른 그룹 멤버의 줄, 대상 없는 역분개, 다른 그룹 분개의 취소를 넣으면 MySQL이 거부한다(오류 3819, 1452).
 - 경쟁 상황: 검사와 INSERT 사이에 다른 취소가 끼는 경우를 흉내 내 유니크 제약이 막는지, 같은 키 동시 요청 4개가 분개 1개만 남기는지.
 - CI는 MySQL 8.0 서비스 컨테이너를 띄우고, 테스트 뒤 `alembic check`로 마이그레이션과 `tables.py`가 같은지 확인한다.
+
+## 4단계: 동시성과 정합성
+
+3단계까지는 쓰기가 서로 부딪혀도 결과가 틀리지 않았다. 원장은 INSERT만 하고(갱신 손실이 없다), 두 번 취소나 같은 멱등성 키는 유니크 제약이 막는다.
+4단계에서 "정산 확정"을 넣으려면 **"이 계획은 원장의 어디까지를 반영했나"** 라는 버전이 필요하고, 여기서 문제가 생긴다.
+
+### 문제: AUTO_INCREMENT id는 버전이 될 수 없다
+
+가장 쉬운 버전은 `MAX(journal_entries.id)`다. 하지만 id는 **번호를 받은 순서**이지 **커밋 순서**가 아니다.
+
+```mermaid
+sequenceDiagram
+    participant A as 트랜잭션 A (지출)
+    participant B as 트랜잭션 B (지출)
+    participant R as 확정 요청
+    A->>A: INSERT -> id 10 (아직 커밋 안 함)
+    B->>B: INSERT -> id 11
+    B->>B: COMMIT
+    R->>R: MAX(id) = 11 -> "버전 11까지 반영"
+    A->>A: COMMIT (id 10이 이제 보인다)
+    Note over R: 버전 11로 확정했는데 id 10은 빠져 있다
+```
+
+`test_auto_increment_order_is_not_commit_order`가 MySQL에서 이 상황을 그대로 만든다.
+
+### 해결: 그룹별 순번 + 그룹 행 잠금
+
+- `settlement_groups.last_seq`(원장 버전)와 `journal_entries.seq`(그룹 안 순번, `UNIQUE (group_id, seq)`)를 둔다.
+- 분개를 쓰는 트랜잭션은 **첫 쿼리로** `SELECT last_seq FROM settlement_groups WHERE id = ? FOR UPDATE`를 한다.
+  같은 그룹의 쓰기는 이 행 잠금에서 한 줄로 서고, 잠금을 잡은 쪽이 `last_seq + 1`을 순번으로 쓰고 커밋한다.
+  그래서 **순번 순서 = 커밋 순서**이고 빈 번호가 없다. 다른 그룹의 쓰기는 기다리지 않는다(행 잠금).
+- 기존 분개의 순번은 데이터 마이그레이션이 `ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY id)`로 채운다.
+
+**왜 "첫 쿼리"여야 하나.** MySQL 기본 격리 수준(REPEATABLE READ)에서 일반 SELECT는 트랜잭션의 **첫 일반 읽기 시점의 스냅숏**을 끝까지 본다.
+잠금보다 먼저 일반 SELECT를 하면, 잠금을 기다리는 동안 다른 트랜잭션이 커밋한 분개가 이후 읽기에서 보이지 않는다.
+`FOR UPDATE`는 잠금 읽기라 스냅숏이 아니라 최신 커밋 값을 읽는다. `test_snapshot_taken_before_lock_misses_commits`가 이 차이를 보여 준다.
+(READ COMMITTED로 낮추면 문장마다 새 스냅숏을 보므로 이 함정은 사라지지만, 한 트랜잭션 안의 두 읽기가 서로 다른 시점을 볼 수 있다.)
+
+| 방법 | 동작 | 장점 | 단점 |
+| --- | --- | --- | --- |
+| 잠금 없음 + MAX(id) | 그대로 | 간단 | 위의 버전 구멍. 확정이 틀릴 수 있다 |
+| **비관적 잠금 (선택)** `FOR UPDATE` | 같은 그룹 쓰기가 기다린다 | 순번 = 커밋 순서, 재시도 코드 없음 | 같은 그룹 쓰기는 동시에 하나. 잠금 대기 |
+| 낙관적 잠금 `UPDATE ... SET last_seq = n+1 WHERE last_seq = n` | 바뀌었으면 0행 -> 재시도 | 잠금을 오래 안 잡는다 | 충돌이 잦으면 재시도 폭주. 클라이언트나 서버에 재시도 루프 필요 |
+| 갭 락에 기대기 | 범위 잠금 읽기로 뒤 INSERT를 막음 | 그룹 행이 필요 없다 | 동작이 격리 수준과 인덱스에 따라 달라 설명하기도, 믿기도 어렵다 |
+
+모임 하나에 동시에 쓰는 사람은 많아야 몇 명이고, 한 번 쓰는 데 수 ms다. 같은 그룹을 한 줄로 세워도 대기는 짧고, 대신 "순번 = 커밋 순서"라는 단순한 규칙을 얻는다.
+멱등성 키도 이 덕을 본다. 같은 키의 동시 요청은 잠금에서 기다렸다가, 잠금을 얻은 뒤의 재확인에서 먼저 커밋된 결과를 보고 그대로 돌려준다(분개를 만들지도 않는다).
+
+`last_seq`를 늘리는 UPDATE는 그룹 행(원장의 메타데이터)에 대한 것이다. 분개, 줄, 멱등성 키에는 여전히 INSERT만 한다(`test_app_never_updates_or_deletes_ledger_rows`).
+
+### 정산 확정
+
+```mermaid
+sequenceDiagram
+    participant C as 클라이언트
+    participant S as 서버
+    C->>S: GET /settlement
+    S-->>C: version 7 + 송금 계획 (같은 스냅숏에서 읽음)
+    Note over C: 사람이 계획을 확인
+    C->>S: POST /settlements {expected_version: 7}
+    S->>S: 그룹 행 잠금 (지출 기록과 같은 잠금)
+    alt last_seq == 7
+        S->>S: 잔액 다시 계산 -> settlements, settlement_transfers INSERT
+        S-->>C: 201 확정 (version 7)
+    else 그사이 지출이 기록됨 (last_seq 8)
+        S-->>C: 409 StaleVersionError {expected_version: 7, current_version: 8}
+    end
+```
+
+- `GET /settlement`은 버전과 잔액을 **한 트랜잭션(같은 스냅숏)** 에서 읽어, 응답의 version과 계획이 정확히 짝이 맞는다.
+- `POST /settlements`는 잠금 아래에서 버전을 비교한다. 확정하는 순간(커밋까지) 원장이 정확히 그 버전이다. 지출과 확정이 동시에 오면 둘 중 하나가 먼저 하고, 지출이 먼저면 확정은 409다(`test_confirm_waits_for_inflight_expense_and_then_is_stale`).
+- 잠금 없이 한 스냅숏에서 읽기만 해도 "버전 N의 올바른 계획"은 나온다. 잠금이 더해 주는 것은 "그 계획이 커밋 순간에도 최신"이라는 보장이다.
+- `UNIQUE (group_id, version)`: 같은 버전으로 다시 확정하면 처음 기록을 200으로 돌려준다(자연 키 멱등성). 다른 strategy로 같은 버전을 확정하려 하면 409.
+- 확정 기록도 추가만 한다. 조회 응답의 `current_version`이 `version`보다 크면 확정 뒤에 분개가 더 기록됐다는 뜻이다. 송금 완료 처리는 6단계.
+
+**알려진 한계: 쓰기가 쉬지 않으면 확정이 굶는다.** 버전을 읽은 뒤 잠금을 얻기까지 다른 쓰기가 하나라도 끼면 409다.
+쓰기 스레드 4개가 쉬지 않고 기록하면 확정은 한 번도 성공하지 못했다([실험](experiments.md#4단계-잔액-계산-방식과-동시성)).
+사람이 입력하는 모임은 쓰기 사이가 초 단위라 문제가 되지 않는다고 판단했다. 필요해지면 "확정 중에는 새 지출을 잠시 막는" 그룹 상태(마감)를 두거나, 서버가 최신 버전으로 바로 확정하는 옵션을 줄 수 있다(대신 사용자가 보지 않은 계획을 확정하게 된다).
+
+### 잔액 계산 방식: 매번 SUM vs 잔액 테이블
+
+측정([experiments.md](experiments.md#4단계-잔액-계산-방식과-동시성)): 줄 1만 개에서 SUM 25ms, 커버링 인덱스 SUM 7ms, 잔액 테이블 0.7ms. 100만 개에서 5.5초, 0.7초, 1.3ms.
+
+| | 매번 SUM (+ 커버링 인덱스) | 잔액 테이블 |
+| --- | --- | --- |
+| 진실의 원천 | 원장 하나 | 원장 + 잔액 두 곳 (어긋날 수 있다) |
+| 조회 | 줄 수에 비례 (1만 줄 7ms) | 멤버 수만큼 (1ms) |
+| 쓰기 | 원장 INSERT만 | 멤버 행 UPDATE 추가 (+20%) |
+| 동시성 | INSERT만이라 갱신 손실 없음 | 읽고 쓰면 갱신 손실, 순서 없이 UPDATE하면 데드락 |
+| 고장 복구 | 필요 없음 | 원장으로 다시 계산하는 작업 필요 |
+
+**결정: 커버링 인덱스 + SUM.** 모임 하나는 줄 수천 ~ 1만 개 규모라 10ms 안쪽이고, 원장 하나만 원천으로 두면 정합성 문제가 생기지 않는다.
+줄이 수십만 개 쌓이는 쓰임새가 생기면 "순번 N까지의 잔액 체크포인트 + N 이후 줄만 SUM"을 먼저 검토한다(체크포인트는 원장으로 다시 만들 수 있다).
+
+### 테스트 (4단계)
+
+- MySQL 동작 확인: AUTO_INCREMENT 순서 ≠ 커밋 순서, 잠금 전 스냅숏이 커밋을 놓침.
+- 그룹 잠금: 같은 그룹 쓰기는 기다리고 다른 그룹은 바로 끝난다. 6개 스레드 x 10건 동시 기록 뒤 순번이 1..60, id 순서 = 순번 순서.
+- 확정: 버전 불일치 409와 `current_version`, 같은 버전 재확정, 다른 그룹의 확정 404, 기록 중인 지출을 기다렸다가 409.
+- 스트레스: 스레드 8개가 지출, 송금, 취소를 섞어 쓰는 동안 확정 스레드가 계속 시도. 끝난 뒤 전체 이력으로 순번, 취소, 잔액(SQL = 줄을 파이썬으로 다시 더한 값), **모든 확정 계획 = 그 버전까지의 분개로 다시 계산한 계획**을 검사한다.
