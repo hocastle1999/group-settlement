@@ -185,7 +185,7 @@ def test_wrong_token_and_missing_group_look_the_same(client):
 
     responses = [
         client.get(f"/api/groups/{gid}/balances", headers=wrong),  # 있는 그룹, 틀린 토큰
-        client.get(f"/api/groups/{gid + 999}/balances", headers=wrong),  # 없는 그룹
+        client.get("/api/groups/1000000000000/balances", headers=wrong),  # 없는 그룹
         client.get(f"/api/groups/{gid}/balances", headers=other_headers),  # 다른 그룹의 토큰
     ]
     assert {r.status_code for r in responses} == {404}
@@ -262,7 +262,7 @@ def test_reversal_retry_is_idempotent_but_second_reversal_conflicts(client):
         ({"amount": 30000}, 422, None),  # JSON 숫자 금액은 거부 (float 오차)
         ({"amount": "1.5"}, 422, "InvalidAmountError"),  # 원은 소수 없음
         ({"amount": "0"}, 422, "InvalidAmountError"),
-        ({"payer_id": 999_999}, 422, "UnknownMemberError"),
+        ({"payer_id": 10**15}, 422, "UnknownMemberError"),
         ({"split": {"type": "equal", "member_ids": []}}, 422, None),
         ({"split": {"type": "unknown"}}, 422, None),
         ({"unexpected": 1}, 422, None),  # 모르는 필드
@@ -304,7 +304,7 @@ def test_transfer_to_self_and_unknown_entry(client):
     gid, headers, ids = create_group(client)
     body = {"sender_id": ids["민수"], "receiver_id": ids["민수"], "amount": "100"}
     assert write(client, f"/api/groups/{gid}/transfers", headers, body).status_code == 422
-    res = write(client, f"/api/groups/{gid}/entries/12345/reversal", headers)
+    res = write(client, f"/api/groups/{gid}/entries/1000000000000/reversal", headers)
     assert res.status_code == 404
     assert res.json()["error"] == "EntryNotFoundError"
 

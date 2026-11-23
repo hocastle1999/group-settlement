@@ -50,11 +50,13 @@ def db_engine(db_settings: DatabaseSettings) -> Iterator[Engine]:
 
 def _clear(engine: Engine) -> None:
     # 원장 테이블은 서로를(역분개는 자기 테이블을) 참조하므로 외래 키 검사를 잠시 끄고 비운다.
-    # TRUNCATE는 AUTO_INCREMENT도 되돌린다. 테스트 정리용일 뿐, 앱 코드는 DELETE를 하지 않는다.
-    with engine.connect() as conn:
+    # TRUNCATE는 쓰지 않는다: InnoDB는 테이블 파일을 지우고 다시 만들어 5개에 약 1초가 걸렸다.
+    # 몇 줄뿐인 테스트 데이터는 DELETE가 2ms (docs/troubleshooting.md).
+    # 테스트 정리용일 뿐, 앱 코드는 원장에 DELETE를 하지 않는다.
+    with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
         for table in reversed(metadata.sorted_tables):
-            conn.execute(text(f"TRUNCATE TABLE {table.name}"))
+            conn.execute(text(f"DELETE FROM {table.name}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
 
 

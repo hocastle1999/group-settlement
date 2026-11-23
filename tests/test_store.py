@@ -132,7 +132,7 @@ def test_reversal_cancels_and_only_once(db):
     with pytest.raises(AlreadyReversedError):
         reverse(db, group, rev.id)  # 취소의 취소
     with pytest.raises(EntryNotFoundError):
-        reverse(db, group, 999)
+        reverse(db, group, 10**15)  # 정리 후에도 id는 계속 늘어나므로 큰 값
     assert count(db, journal_entries) == 2
 
 
