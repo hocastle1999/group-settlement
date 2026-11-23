@@ -2,18 +2,20 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
-# 앱 모듈을 import하기 "전에" 테스트 DB를 정한다 (저장 계층이 .env보다 이 값을 먼저 보게).
+# 앱 모듈을 import하기 "전에" 테스트 DB를 정한다 (app.main은 import할 때 앱을 만든다).
 # 환경 변수는 .env보다 우선한다. 이름이 _test로 끝나는 DB만 쓴다 (아래 db_settings).
 os.environ["DB_NAME"] = os.environ.get("TEST_DB_NAME", "group_settlement_test")
 
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 from hypothesis import settings  # noqa: E402
 from sqlalchemy import Engine, text  # noqa: E402
 
 from app.db.config import DatabaseSettings, create_db_engine  # noqa: E402
 from app.db.tables import metadata  # noqa: E402
+from app.main import create_app  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,3 +66,11 @@ def db(db_engine: Engine) -> Iterator[Engine]:
     """
     _clear(db_engine)
     yield db_engine
+
+
+@pytest.fixture
+def client(db: Engine, db_settings: DatabaseSettings) -> Iterator[TestClient]:
+    app = create_app(db_settings)
+    app.state.engine = db  # 테스트와 같은 엔진을 써서 SQL 감시(이벤트)도 같은 곳에 건다
+    with TestClient(app) as c:
+        yield c
