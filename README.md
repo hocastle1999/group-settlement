@@ -16,7 +16,9 @@
 | 거래 기록 | 이중기입 원장 (차변 합 = 대변 합) | 모든 멤버 잔액의 합이 언제나 0. 계산 실수가 구조적으로 드러난다 |
 | 잘못 기록한 거래 | 수정·삭제 없이 역분개 추가 (append-only) | 무엇이 언제 바뀌었는지 기록 자체에 남는다 |
 | 정산 송금 | 16명 이하는 비트마스크 DP 최적해, 넘으면 그리디 | 1/N처럼 둥근 금액이면 그리디가 1 ~ 2번 더 보낸다. DP는 16명 37ms ([실험](docs/experiments.md)) |
-| 인증 | 회원가입 없이 그룹별 초대 링크 토큰 | 실제 정산 앱의 사용 방식. 1번 프로젝트의 JWT와 다른 설계 (3단계) |
+| 인증 | 회원가입 없이 그룹별 초대 링크 토큰, DB에는 SHA-256 해시만 | 실제 정산 앱의 사용 방식. 틀린 토큰도 없는 그룹도 같은 404 (그룹 존재 여부를 숨김) |
+| 재시도 | 분개 쓰기에 `Idempotency-Key` 필수, 키와 분개를 한 트랜잭션에 | 응답을 못 받고 다시 보내도 지출이 두 번 기록되지 않는다. 동시 재시도도 유니크 잠금으로 하나만 |
+| DB 정합성 | `CHECK (amount > 0)`, 역분개 대상 유니크, 복합 외래 키 | 코어를 거치지 않은 쓰기나 동시 요청도 규칙을 못 깬다 |
 
 자세한 내용은 [docs/design.md](docs/design.md).
 
@@ -24,7 +26,7 @@
 
 1. [x] **금액·원장 코어** (순수 파이썬): `Money`, 분할 규칙(균등·비율·정액), 이중기입 분개, 역분개, property-based 테스트
 2. [x] **최소 송금 알고리즘**: 그리디 vs 비트마스크 DP 최적해. 둥근 금액 12명 모임에서 그리디가 64% 더 많이 보냄 ([실험](docs/experiments.md))
-3. [ ] **DB 스키마 + REST API**: MySQL, 추가만 하는 원장 테이블, CHECK 제약, 멱등성 키, 초대 링크 토큰
+3. [x] **DB 스키마 + REST API**: MySQL, 추가만 하는 원장 테이블, CHECK 제약, 멱등성 키, 초대 링크 토큰. 규칙은 코어를 재사용하고 SQL 잔액을 메모리 원장과 비교 테스트
 4. [ ] **동시성·정합성**: 동시 지출 추가와 정산 확정, 매번 합산 vs 잔액 테이블 비교
 5. [ ] **다중 통화**: 지출 시점 환율 저장, 환산 반올림 처리
 6. [ ] **정산 확정·송금 완료**: 감사 로그, 리포트 SQL, 데모 페이지
@@ -35,8 +37,49 @@
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q
+
+# DB 준비 (최초 1회)
+# 1) MySQL 8.0에서 root로 scripts/init_db.sql 실행 ('여기에_비밀번호'를 바꿔서)
+# 2) .env.example을 .env로 복사하고 DB_PASSWORD에 같은 비밀번호
+Copy-Item .env.example .env
+.\.venv\Scripts\alembic.exe upgrade head
+
+.\.venv\Scripts\python.exe -m pytest -q                    # 테스트 (group_settlement_test DB 사용)
+.\.venv\Scripts\python.exe -m uvicorn app.main:app         # API 서버, 문서: http://localhost:8000/docs
 .\.venv\Scripts\python.exe -m scripts.compare_settlement   # 그리디 vs 최적 실험
+```
+
+| 환경 변수 (`.env`) | 기본값 | 설명 |
+| --- | --- | --- |
+| `DB_HOST` | `127.0.0.1` | |
+| `DB_PORT` | `3306` | |
+| `DB_NAME` | `group_settlement` | 테스트는 `TEST_DB_NAME`(기본 `group_settlement_test`), 이름이 `_test`로 끝나야 실행 |
+| `DB_USER` | `group_settlement_app` | |
+| `DB_PASSWORD` | (없음) | `scripts/init_db.sql`에 넣은 값 |
+
+## 사용 예 (REST API)
+
+Windows PowerShell 5.1에서는 `-ContentType`에 `charset=utf-8`을 꼭 붙인다. 없으면 한글 본문이 `?`로 바뀌어 저장된다 ([문제 해결](docs/troubleshooting.md)).
+
+```powershell
+$json = "application/json; charset=utf-8"
+# 그룹 생성: invite_token은 이 응답에서만 볼 수 있다
+$g = Invoke-RestMethod -Method Post http://localhost:8000/api/groups -ContentType $json `
+  -Body '{"name": "제주 여행", "currency": "KRW"}'
+$h = @{ Authorization = "Bearer $($g.invite_token)" }
+$base = "http://localhost:8000/api/groups/$($g.id)"
+
+$a = Invoke-RestMethod -Method Post "$base/members" -Headers $h -ContentType $json -Body '{"name": "민수"}'
+$b = Invoke-RestMethod -Method Post "$base/members" -Headers $h -ContentType $json -Body '{"name": "지영"}'
+
+# 지출: 금액은 문자열, 재시도에 대비해 Idempotency-Key 필수
+$body = @{ payer_id = $a.id; amount = "30000"; memo = "저녁";
+           split = @{ type = "equal"; member_ids = @($a.id, $b.id) } } | ConvertTo-Json
+Invoke-RestMethod -Method Post "$base/expenses" -ContentType $json -Body $body `
+  -Headers ($h + @{ "Idempotency-Key" = [guid]::NewGuid().ToString() })
+
+(Invoke-RestMethod "$base/balances" -Headers $h).balances       # 민수 15000, 지영 -15000
+(Invoke-RestMethod "$base/settlement" -Headers $h).transfers    # 지영 -> 민수 15000
 ```
 
 ## 사용 예 (1단계 코어)
