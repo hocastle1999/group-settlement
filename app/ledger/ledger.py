@@ -252,7 +252,8 @@ class Ledger:
     def balances(self) -> dict[MemberId, Money]:
         """멤버별 잔액 (대변 합계 - 차변 합계). 기록이 없는 멤버는 0. 합은 항상 0이다.
 
-        매번 전체 분개를 다시 더한다. 잔액을 따로 저장하는 방식과의 비교는 4단계에서 한다.
+        매번 전체 분개를 다시 더한다. DB도 같은 방식(SUM)을 쓴다. 잔액 테이블과의 비교는
+        docs/experiments.md 4단계.
         """
         minor: dict[MemberId, int] = {m: 0 for m in sorted(self._members)}
         for posted in self._entries:

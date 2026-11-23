@@ -136,7 +136,10 @@ entry_lines = Table(
         ["group_id", "entry_id"], ["journal_entries.group_id", "journal_entries.id"]
     ),
     ForeignKeyConstraint(["group_id", "member_id"], ["members.group_id", "members.id"]),
-    Index(None, "group_id", "member_id"),
+    # 커버링 인덱스: 잔액 SUM에 필요한 열(side, amount)까지 담아 인덱스만 읽고 끝난다.
+    # 줄 1만 개에서 25ms -> 7ms, 100만 개에서 5.5s -> 0.7s (docs/experiments.md 4단계).
+    # 앞부분 (group_id, member_id)가 멤버 외래 키의 인덱스 역할도 한다.
+    Index(None, "group_id", "member_id", "side", "amount"),
     CheckConstraint(_in("side", SIDES), name="side"),
     CheckConstraint("amount > 0", name="amount_positive"),
 )
