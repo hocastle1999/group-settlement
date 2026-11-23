@@ -31,6 +31,8 @@ from app.db.tables import (
     journal_entries,
     members,
     settlement_groups,
+    settlement_transfers,
+    settlements,
 )
 from app.ledger import (
     AlreadyReversedError,
@@ -42,11 +44,13 @@ from app.ledger import (
     Money,
     PostedEntry,
     Side,
+    Strategy,
     UnbalancedBalancesError,
     check_postable,
     check_reversal,
     get_currency,
     reversal_of,
+    settle,
     total_balance,
 )
 
@@ -483,3 +487,159 @@ def group_balances(conn: Connection, group: Group) -> dict[int, Money]:
     if not total.is_zero():
         raise UnbalancedBalancesError(f"그룹 {group.id}의 잔액 합이 0이 아니다: {total}")
     return result
+
+
+# ---------------------------------------------------------------- 정산 확정 (4단계)
+
+
+class StaleVersionError(StoreError):
+    """확정하려는 버전 이후에 분개가 더 기록됐다. 최신 정산 계획을 다시 받아 확정해야 한다."""
+
+    def __init__(self, expected: int, current: int):
+        super().__init__(f"원장 버전이 바뀌었다: 요청 {expected}, 현재 {current}")
+        self.extra = {"expected_version": expected, "current_version": current}
+
+
+class SettlementConflictError(StoreError):
+    """같은 버전이 다른 방법(strategy)으로 이미 확정됐다."""
+
+
+class SettlementNotFoundError(StoreError):
+    """이 그룹에 없는 정산."""
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementTransfer:
+    sender_id: int
+    receiver_id: int
+    amount: Money
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSettlement:
+    id: int
+    version: int
+    strategy: Strategy
+    created_at: datetime
+    transfers: tuple[SettlementTransfer, ...]
+
+
+def plan_settlement(balances: dict[int, Money], strategy: Strategy) -> list[SettlementTransfer]:
+    """잔액 -> 송금 계획. 계산은 코어(`settle`)가 하고 여기서는 id만 바꾼다."""
+    transfers = settle({member_key(m): v for m, v in balances.items()}, strategy)
+    return [SettlementTransfer(int(t.sender), int(t.receiver), t.amount) for t in transfers]
+
+
+def confirm_settlement(
+    engine: Engine, group: Group, expected_version: int, strategy: Strategy
+) -> tuple[StoredSettlement, bool]:
+    """원장 버전이 `expected_version`일 때만 그 시점의 송금 계획을 확정 기록한다.
+
+    돌려주는 bool은 새로 기록했는지(False면 같은 버전의 이전 확정을 돌려줌).
+
+    그룹 잠금 아래에서 버전을 비교하고 잔액을 읽는다. 지출 기록도 같은 잠금을 잡으므로
+    "확정하는 순간 원장은 정확히 그 버전"이 커밋 시점까지 보장된다. 확정과 지출이 동시에 오면
+    둘 중 하나가 먼저 하고, 지출이 먼저면 확정은 409(StaleVersionError)다.
+    (잠금 없이 한 스냅숏에서 읽기만 해도 "버전 N의 올바른 계획"은 나온다. 잠금은 그 계획이
+    커밋 순간에도 최신이라는 것까지 보장한다.)
+    """
+    with engine.begin() as conn:
+        current = lock_group(conn, group.id)  # 첫 쿼리 (lock_group 설명 참고)
+        existing = _settlement_by_version(conn, group, expected_version)
+        if existing is not None:
+            # 같은 버전을 다시 확정: 재시도로 보고 처음 기록을 돌려준다.
+            if existing.strategy is not strategy:
+                raise SettlementConflictError(
+                    f"버전 {expected_version}은 이미 {existing.strategy.value}로 확정됐다"
+                )
+            return existing, False
+        if current != expected_version:
+            raise StaleVersionError(expected_version, current)
+
+        transfers = plan_settlement(group_balances(conn, group), strategy)
+        settlement_id = int(
+            conn.execute(
+                settlements.insert().values(
+                    group_id=group.id, version=current, strategy=strategy.value
+                )
+            ).inserted_primary_key[0]
+        )
+        if transfers:
+            conn.execute(
+                settlement_transfers.insert(),
+                [
+                    {
+                        "group_id": group.id,
+                        "settlement_id": settlement_id,
+                        "line_no": no,
+                        "sender_member_id": t.sender_id,
+                        "receiver_member_id": t.receiver_id,
+                        "amount": t.amount.amount,
+                    }
+                    for no, t in enumerate(transfers, start=1)
+                ],
+            )
+        return _load_settlement(conn, group, settlement_id), True
+
+
+def get_settlement(engine: Engine, group: Group, settlement_id: int) -> StoredSettlement:
+    with engine.connect() as conn:
+        return _load_settlement(conn, group, settlement_id)
+
+
+def list_settlements(engine: Engine, group: Group, limit: int) -> list[StoredSettlement]:
+    """최근 확정부터."""
+    with engine.connect() as conn:
+        ids = conn.execute(
+            select(settlements.c.id)
+            .where(settlements.c.group_id == group.id)
+            .order_by(settlements.c.version.desc())
+            .limit(limit)
+        ).scalars()
+        return [_load_settlement(conn, group, i) for i in ids]
+
+
+def current_version(engine: Engine, group: Group) -> int:
+    with engine.connect() as conn:
+        return conn.execute(
+            select(settlement_groups.c.last_seq).where(settlement_groups.c.id == group.id)
+        ).scalar_one()
+
+
+def _settlement_by_version(conn: Connection, group: Group, version: int) -> StoredSettlement | None:
+    settlement_id = conn.execute(
+        select(settlements.c.id).where(
+            settlements.c.group_id == group.id, settlements.c.version == version
+        )
+    ).scalar_one_or_none()
+    return None if settlement_id is None else _load_settlement(conn, group, settlement_id)
+
+
+def _load_settlement(conn: Connection, group: Group, settlement_id: int) -> StoredSettlement:
+    head = conn.execute(
+        select(settlements).where(
+            settlements.c.group_id == group.id, settlements.c.id == settlement_id
+        )
+    ).one_or_none()
+    if head is None:
+        raise SettlementNotFoundError(f"정산 {settlement_id}가 없다")
+    rows = conn.execute(
+        select(settlement_transfers)
+        .where(
+            settlement_transfers.c.group_id == group.id,
+            settlement_transfers.c.settlement_id == settlement_id,
+        )
+        .order_by(settlement_transfers.c.line_no)
+    )
+    return StoredSettlement(
+        id=head.id,
+        version=head.version,
+        strategy=Strategy(head.strategy),
+        created_at=head.created_at.replace(tzinfo=UTC),
+        transfers=tuple(
+            SettlementTransfer(
+                r.sender_member_id, r.receiver_member_id, Money(r.amount, group.currency)
+            )
+            for r in rows
+        ),
+    )

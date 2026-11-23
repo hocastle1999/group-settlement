@@ -26,7 +26,7 @@ from sqlalchemy import (
     text,
 )
 
-from app.ledger import CURRENCIES, EntryKind, Side
+from app.ledger import CURRENCIES, EntryKind, Side, Strategy
 
 # 제약과 인덱스 이름 규칙. 이름이 정해져 있어야 마이그레이션에서 지우거나 바꿀 수 있다.
 metadata = MetaData(
@@ -157,4 +157,45 @@ idempotency_keys = Table(
         ["group_id", "entry_id"], ["journal_entries.group_id", "journal_entries.id"]
     ),
     Index(None, "group_id", "entry_id"),
+)
+
+# 확정된 정산(4단계). "원장 버전 version까지의 잔액으로 계산한 송금 계획"을 그대로 남긴다.
+# 확정 기록도 고치거나 지우지 않는다. 송금 완료 처리는 6단계.
+SETTLEMENT_STRATEGIES = [s.value for s in Strategy]
+
+settlements = Table(
+    "settlements",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("group_id", BigInteger, nullable=False),
+    # 확정 시점의 원장 버전(settlement_groups.last_seq). 이 순번까지의 분개로 계산했다.
+    Column("version", BigInteger, nullable=False),
+    Column("strategy", String(16), nullable=False),
+    Column("created_at", DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")),
+    ForeignKeyConstraint(["group_id"], ["settlement_groups.id"]),
+    # 한 버전은 한 번만 확정한다. 같은 버전으로 다시 확정하면 처음 기록을 돌려준다(자연 키 멱등성).
+    UniqueConstraint("group_id", "version"),
+    UniqueConstraint("group_id", "id"),
+    CheckConstraint("version >= 0", name="version_not_negative"),
+    CheckConstraint(_in("strategy", SETTLEMENT_STRATEGIES), name="strategy"),
+)
+
+settlement_transfers = Table(
+    "settlement_transfers",
+    metadata,
+    Column("group_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("settlement_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("line_no", SmallInteger, primary_key=True, autoincrement=False),
+    Column("sender_member_id", BigInteger, nullable=False),
+    Column("receiver_member_id", BigInteger, nullable=False),
+    Column("amount", AMOUNT, nullable=False),
+    ForeignKeyConstraint(["group_id", "settlement_id"], ["settlements.group_id", "settlements.id"]),
+    ForeignKeyConstraint(["group_id", "sender_member_id"], ["members.group_id", "members.id"]),
+    ForeignKeyConstraint(["group_id", "receiver_member_id"], ["members.group_id", "members.id"]),
+    # 외래 키마다 인덱스가 있어야 한다. 직접 만들지 않으면 MySQL이 이름을 지어 만들고,
+    # 그러면 모델(tables.py)과 DB가 달라 alembic check가 차이를 보고한다.
+    Index(None, "group_id", "sender_member_id"),
+    Index(None, "group_id", "receiver_member_id"),
+    CheckConstraint("amount > 0", name="amount_positive"),
+    CheckConstraint("sender_member_id <> receiver_member_id", name="different_members"),
 )

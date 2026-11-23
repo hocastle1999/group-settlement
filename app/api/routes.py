@@ -27,7 +27,6 @@ from app.ledger import (
     Strategy,
     expense_entry,
     get_currency,
-    settle,
     transfer_entry,
 )
 
@@ -186,22 +185,87 @@ def get_settlement(
     engine: EngineDep,
     strategy: Strategy = Strategy.AUTO,
 ) -> s.SettlementOut:
-    """지금 잔액을 0으로 만드는 송금 목록. 계산만 하고 기록하지 않는다 (송금은 /transfers)."""
-    balances = store.balances(engine, group)
-    transfers = settle({member_key(m): v for m, v in balances.items()}, strategy)
+    """지금 잔액을 0으로 만드는 송금 목록. 계산만 하고 기록하지 않는다 (확정은 POST /settlements).
+
+    버전과 잔액을 같은 스냅숏에서 읽으므로 응답의 version은 이 계획과 정확히 짝이 맞는다.
+    """
+    snap = store.snapshot(engine, group)
     return s.SettlementOut(
         currency=group.currency.code,
         strategy=strategy,
-        transfers=[
-            s.TransferOut(
-                sender_id=int(t.sender), receiver_id=int(t.receiver), amount=str(t.amount.amount)
-            )
-            for t in transfers
-        ],
+        version=snap.version,
+        transfers=_transfers_out(store.plan_settlement(snap.balances, strategy)),
     )
 
 
+# ---------------------------------------------------------------- 정산 확정
+
+
+@router.post(
+    "/groups/{group_id}/settlements",
+    status_code=status.HTTP_201_CREATED,
+    response_model=s.ConfirmedSettlementOut,
+)
+def confirm_settlement(
+    body: s.SettlementConfirm, group: CurrentGroup, engine: EngineDep, response: Response
+) -> s.ConfirmedSettlementOut:
+    """GET /settlement에서 받은 version으로 확정한다. 그사이 분개가 더 기록됐으면 409.
+
+    멱등성 키를 받지 않는다: (그룹, 버전)이 유일하므로 같은 버전으로 다시 보내면
+    처음 확정을 200으로 돌려준다(자연 키).
+    """
+    settlement, created = store.confirm_settlement(
+        engine, group, body.expected_version, body.strategy
+    )
+    if not created:
+        response.status_code = status.HTTP_200_OK
+        response.headers["Idempotent-Replayed"] = "true"
+    return _confirmed_out(group, settlement, store.current_version(engine, group))
+
+
+@router.get("/groups/{group_id}/settlements", response_model=s.ConfirmedSettlementList)
+def list_settlements(
+    group: CurrentGroup,
+    engine: EngineDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> s.ConfirmedSettlementList:
+    current = store.current_version(engine, group)
+    items = store.list_settlements(engine, group, limit)
+    return s.ConfirmedSettlementList(settlements=[_confirmed_out(group, x, current) for x in items])
+
+
+@router.get(
+    "/groups/{group_id}/settlements/{settlement_id}", response_model=s.ConfirmedSettlementOut
+)
+def get_confirmed_settlement(
+    settlement_id: int, group: CurrentGroup, engine: EngineDep
+) -> s.ConfirmedSettlementOut:
+    settlement = store.get_settlement(engine, group, settlement_id)
+    return _confirmed_out(group, settlement, store.current_version(engine, group))
+
+
 # ---------------------------------------------------------------- 도우미
+
+
+def _transfers_out(transfers: list[store.SettlementTransfer]) -> list[s.TransferOut]:
+    return [
+        s.TransferOut(sender_id=t.sender_id, receiver_id=t.receiver_id, amount=str(t.amount.amount))
+        for t in transfers
+    ]
+
+
+def _confirmed_out(
+    group: Group, settlement: store.StoredSettlement, current: int
+) -> s.ConfirmedSettlementOut:
+    return s.ConfirmedSettlementOut(
+        id=settlement.id,
+        version=settlement.version,
+        current_version=current,
+        currency=group.currency.code,
+        strategy=settlement.strategy,
+        created_at=settlement.created_at,
+        transfers=_transfers_out(list(settlement.transfers)),
+    )
 
 
 def _group_out(group: Group, members: list[store.Member]) -> s.GroupOut:

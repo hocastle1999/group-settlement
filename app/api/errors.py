@@ -12,7 +12,14 @@ import logging
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from app.db.store import DuplicateMemberError, IdempotencyKeyReusedError, StoreError
+from app.db.store import (
+    DuplicateMemberError,
+    IdempotencyKeyReusedError,
+    SettlementConflictError,
+    SettlementNotFoundError,
+    StaleVersionError,
+    StoreError,
+)
 from app.ledger import (
     AlreadyReversedError,
     CurrencyMismatchError,
@@ -38,9 +45,13 @@ STATUS_BY_ERROR: list[tuple[type[Exception], int]] = [
     (UnknownMemberError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     (TooManyMembersError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     (EntryNotFoundError, status.HTTP_404_NOT_FOUND),
+    (SettlementNotFoundError, status.HTTP_404_NOT_FOUND),
     # 지금 상태와 충돌한다: 이미 취소됨, 이름 중복
     (AlreadyReversedError, status.HTTP_409_CONFLICT),
     (DuplicateMemberError, status.HTTP_409_CONFLICT),
+    # 확정하려던 버전 뒤에 분개가 더 생김 / 같은 버전이 다른 방법으로 이미 확정됨
+    (StaleVersionError, status.HTTP_409_CONFLICT),
+    (SettlementConflictError, status.HTTP_409_CONFLICT),
     # 같은 키를 다른 요청에 재사용 (IETF Idempotency-Key 초안의 권고)
     (IdempotencyKeyReusedError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     # 원장이 깨졌다: 클라이언트 잘못이 아니라 서버 버그
@@ -61,7 +72,10 @@ async def _handle(request: Request, exc: Exception) -> JSONResponse:
         # 내부 사정(잔액 합 등)은 로그에만 남기고 응답에는 넣지 않는다.
         logger.error("원장 오류 %s %s: %s", request.method, request.url.path, exc)
         return JSONResponse({"error": "InternalError", "detail": "서버 오류"}, status_code=code)
-    return JSONResponse({"error": type(exc).__name__, "detail": str(exc)}, status_code=code)
+    body = {"error": type(exc).__name__, "detail": str(exc)}
+    # 클라이언트가 다음 행동을 정하는 데 필요한 값(예: 현재 원장 버전)은 별도 필드로 준다.
+    body.update(getattr(exc, "extra", {}))
+    return JSONResponse(body, status_code=code)
 
 
 def install(app: FastAPI) -> None:

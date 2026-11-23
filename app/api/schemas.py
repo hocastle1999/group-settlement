@@ -150,4 +150,26 @@ class TransferOut(BaseModel):
 class SettlementOut(BaseModel):
     currency: str
     strategy: Strategy
+    # 이 계획을 계산한 원장 버전(그 시점의 마지막 분개 순번). 확정할 때 expected_version으로 보낸다.
+    version: int
     transfers: list[TransferOut]
+
+
+class SettlementConfirm(Request):
+    expected_version: int = Field(ge=0)
+    strategy: Strategy = Strategy.AUTO
+
+
+class ConfirmedSettlementOut(BaseModel):
+    id: int
+    version: int
+    # 지금 원장 버전. version보다 크면 확정 뒤에 분개가 더 기록됐다는 뜻이다.
+    current_version: int
+    currency: str
+    strategy: Strategy
+    created_at: datetime
+    transfers: list[TransferOut]
+
+
+class ConfirmedSettlementList(BaseModel):
+    settlements: list[ConfirmedSettlementOut]
