@@ -53,6 +53,7 @@ from app.ledger import (
     reversal_of,
     settle,
     total_balance,
+    transfer_entry,
 )
 from app.ledger.settle import DEFAULT_OPTIMAL_LIMIT
 
@@ -107,6 +108,7 @@ class StoredEntry:
     reverses_entry_id: int | None
     reversed_by_entry_id: int | None  # 이 분개를 취소한 역분개 id
     original: ForeignAmount | None  # 외화 지출이면 원래 금액과 환율 (줄은 기준 통화)
+    settlement_link: tuple[int, int] | None  # 송금 완료면 (확정 정산 id, 송금 줄 번호)
     created_at: datetime
     lines: tuple[StoredLine, ...]
 
@@ -195,6 +197,7 @@ def post_entry(
     build: EntryBuilder,
     idempotency_key: str,
     request_hash: bytes,
+    link: tuple[int, int] | None = None,
 ) -> PostResult:
     """분개 하나를 검사하고 기록한다. 같은 멱등성 키로 다시 오면 처음 결과를 돌려준다.
 
@@ -219,7 +222,7 @@ def post_entry(
                 return replay
             seq = last_seq + 1
             entry = build(conn, seq)
-            entry_id = _insert_checked(conn, group, entry, seq)
+            entry_id = _insert_checked(conn, group, entry, seq, link)
             conn.execute(
                 update(settlement_groups)
                 .where(settlement_groups.c.id == group.id)
@@ -286,7 +289,13 @@ def _find_replay(
     return PostResult(_load_entries(conn, group_id, [row.entry_id])[0], replayed=True)
 
 
-def _insert_checked(conn: Connection, group: Group, entry: JournalEntry, seq: int) -> int:
+def _insert_checked(
+    conn: Connection,
+    group: Group,
+    entry: JournalEntry,
+    seq: int,
+    link: tuple[int, int] | None = None,
+) -> int:
     member_ids = [member_key(m.id) for m in list_members(conn, group.id)]
     check_postable(entry, group.currency, member_ids)
     if entry.kind is EntryKind.REVERSAL:
@@ -305,6 +314,8 @@ def _insert_checked(conn: Connection, group: Group, entry: JournalEntry, seq: in
                 original_currency=entry.source.amount.currency.code if entry.source else None,
                 original_amount=entry.source.amount.amount if entry.source else None,
                 fx_rate=entry.source.rate if entry.source else None,
+                settlement_id=link[0] if link else None,
+                settlement_line_no=link[1] if link else None,
             )
         )
     except IntegrityError as exc:
@@ -402,6 +413,8 @@ def _load_entries(conn: Connection, group_id: int, ids: Sequence[int]) -> list[S
             journal_entries.c.original_currency,
             journal_entries.c.original_amount,
             journal_entries.c.fx_rate,
+            journal_entries.c.settlement_id,
+            journal_entries.c.settlement_line_no,
             journal_entries.c.created_at,
             reverser.c.id.label("reversed_by"),
         )
@@ -436,6 +449,9 @@ def _load_entries(conn: Connection, group_id: int, ids: Sequence[int]) -> list[S
                 )
             ),
             reversed_by_entry_id=h.reversed_by,
+            settlement_link=(
+                None if h.settlement_id is None else (h.settlement_id, h.settlement_line_no)
+            ),
             created_at=h.created_at.replace(tzinfo=UTC),  # DB에는 UTC로 저장된다 (연결 시간대)
             lines=tuple(lines.get(h.id, ())),
         )
@@ -542,6 +558,12 @@ class StoredSettlement:
     strategy: Strategy
     created_at: datetime
     transfers: tuple[SettlementTransfer, ...]
+    # 완료된 송금 줄: 줄 번호(1부터) -> 그 송금을 기록한 분개 id. 취소된 완료는 빠진다.
+    completions: dict[int, int]
+
+    @property
+    def completed(self) -> bool:
+        return len(self.completions) == len(self.transfers)
 
 
 def plan_settlement(
@@ -668,4 +690,61 @@ def _load_settlement(conn: Connection, group: Group, settlement_id: int) -> Stor
             )
             for r in rows
         ),
+        completions=_active_completions(conn, group, settlement_id),
     )
+
+
+# ---------------------------------------------------------------- 송금 완료 (6단계)
+
+
+class TransferAlreadyCompletedError(StoreError):
+    """이 송금 줄은 이미 완료됐다 (완료 송금이 취소되지 않은 채 있다)."""
+
+
+def _active_completions(
+    conn: Connection, group: Group, settlement_id: int, line_no: int | None = None
+) -> dict[int, int]:
+    """줄 번호 -> 완료 송금 분개 id. 역분개가 있는(취소된) 완료는 빼고 본다."""
+    reverser = journal_entries.alias("reverser")
+    query = (
+        select(journal_entries.c.settlement_line_no, journal_entries.c.id)
+        .select_from(
+            journal_entries.outerjoin(
+                reverser, reverser.c.reverses_entry_id == journal_entries.c.id
+            )
+        )
+        .where(
+            journal_entries.c.group_id == group.id,
+            journal_entries.c.settlement_id == settlement_id,
+            reverser.c.id.is_(None),
+        )
+    )
+    if line_no is not None:
+        query = query.where(journal_entries.c.settlement_line_no == line_no)
+    return {row.settlement_line_no: row.id for row in conn.execute(query)}
+
+
+def completion_builder(group: Group, settlement_id: int, line_no: int, memo: str) -> EntryBuilder:
+    """확정 정산의 송금 한 줄을 "보냈다"로 기록하는 송금 분개를 만든다.
+
+    "한 줄은 동시에 한 번만 완료"는 DB 유니크 제약으로 표현할 수 없다. 완료를 취소(역분개)한 뒤
+    다시 완료하는 것은 허용해야 해서, (정산, 줄)에 유니크를 걸면 재완료까지 막힌다.
+    그래서 이 함수는 그룹 잠금 안에서 불린다는 점(`post_entry`)에 기대어 "취소되지 않은 완료가
+    없다"를 확인한다. 같은 그룹의 쓰기는 잠금에서 한 줄로 서므로 두 요청이 함께 통과할 수 없다.
+    """
+
+    def build(conn: Connection, _seq: int) -> JournalEntry:
+        settlement = _load_settlement(conn, group, settlement_id)
+        if not 1 <= line_no <= len(settlement.transfers):
+            raise SettlementNotFoundError(f"정산 {settlement_id}에 {line_no}번 송금이 없다")
+        done = _active_completions(conn, group, settlement_id, line_no)
+        if done:
+            raise TransferAlreadyCompletedError(
+                f"정산 {settlement_id}의 {line_no}번 송금은 분개 {done[line_no]}로 이미 완료됐다"
+            )
+        planned = settlement.transfers[line_no - 1]
+        return transfer_entry(
+            member_key(planned.sender_id), member_key(planned.receiver_id), planned.amount, memo
+        )
+
+    return build

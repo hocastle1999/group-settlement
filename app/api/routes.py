@@ -174,6 +174,34 @@ def reverse_entry(
     return _entry_response(result, response)
 
 
+@router.post(
+    "/groups/{group_id}/settlements/{settlement_id}/transfers/{line_no}/complete",
+    status_code=status.HTTP_201_CREATED,
+    response_model=s.EntryOut,
+)
+def complete_transfer(
+    settlement_id: int,
+    line_no: int,
+    group: CurrentGroup,
+    engine: EngineDep,
+    request: Request,
+    response: Response,
+    body: s.CompletionCreate | None = None,
+    idempotency_key: IdempotencyKeyHeader = None,
+) -> s.EntryOut:
+    """확정 정산의 송금 한 줄을 "보냈다"로 기록한다 = 그 금액의 송금 분개를 남긴다.
+
+    잘못 눌렀으면 응답의 분개를 취소(reversal)한다. 그러면 그 줄은 다시 미완료가 된다.
+    """
+    key = _require_key(idempotency_key)
+    body = body or s.CompletionCreate()
+    build = store.completion_builder(group, settlement_id, line_no, body.memo)
+    result = store.post_entry(
+        engine, group, build, key, _request_hash(request, body), link=(settlement_id, line_no)
+    )
+    return _entry_response(result, response)
+
+
 # ---------------------------------------------------------------- 조회
 
 
@@ -295,7 +323,17 @@ def _confirmed_out(
         currency=group.currency.code,
         strategy=settlement.strategy,
         created_at=settlement.created_at,
-        transfers=_transfers_out(list(settlement.transfers)),
+        transfers=[
+            s.ConfirmedTransferOut(
+                line_no=no,
+                sender_id=t.sender_id,
+                receiver_id=t.receiver_id,
+                amount=str(t.amount.amount),
+                completed_entry_id=settlement.completions.get(no),
+            )
+            for no, t in enumerate(settlement.transfers, start=1)
+        ],
+        completed=settlement.completed,
     )
 
 
@@ -381,6 +419,8 @@ def _entry_out(entry: StoredEntry) -> s.EntryOut:
                 fx_rate=str(entry.original.rate.normalize()),
             )
         ),
+        settlement_id=entry.settlement_link[0] if entry.settlement_link else None,
+        settlement_line_no=entry.settlement_link[1] if entry.settlement_link else None,
         created_at=entry.created_at,
         lines=[
             s.LineOut(member_id=ln.member_id, side=ln.side, amount=str(ln.amount.amount))

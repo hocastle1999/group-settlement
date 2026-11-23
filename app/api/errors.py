@@ -19,6 +19,7 @@ from app.db.store import (
     SettlementNotFoundError,
     StaleVersionError,
     StoreError,
+    TransferAlreadyCompletedError,
 )
 from app.ledger import (
     AlreadyReversedError,
@@ -54,6 +55,7 @@ STATUS_BY_ERROR: list[tuple[type[Exception], int]] = [
     # 확정하려던 버전 뒤에 분개가 더 생김 / 같은 버전이 다른 방법으로 이미 확정됨
     (StaleVersionError, status.HTTP_409_CONFLICT),
     (SettlementConflictError, status.HTTP_409_CONFLICT),
+    (TransferAlreadyCompletedError, status.HTTP_409_CONFLICT),
     # 같은 키를 다른 요청에 재사용 (IETF Idempotency-Key 초안의 권고)
     (IdempotencyKeyReusedError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     # 원장이 깨졌다: 클라이언트 잘못이 아니라 서버 버그

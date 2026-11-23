@@ -65,7 +65,13 @@ def test_confirm_records_the_plan_of_that_version(client):
     assert res.status_code == 201, res.text
     confirmed = res.json()
     assert confirmed["version"] == confirmed["current_version"] == 2
-    assert confirmed["transfers"] == current["transfers"]  # 보여 준 계획 그대로 기록
+    # 보여 준 계획 그대로 기록 (확정 응답에는 줄 번호와 완료 여부가 더 붙는다)
+    plain = [
+        {k: t[k] for k in ("sender_id", "receiver_id", "amount")} for t in confirmed["transfers"]
+    ]
+    assert plain == current["transfers"]
+    assert [t["line_no"] for t in confirmed["transfers"]] == [1, 2][: len(plain)]
+    assert confirmed["completed"] is False
 
     # 같은 버전으로 다시 확정 = 재시도: 처음 기록을 200으로
     again = confirm(client, gid, headers, 2)
@@ -242,3 +248,129 @@ def test_invalid_limit_setting_is_rejected_at_startup(monkeypatch, value):
     monkeypatch.setenv("SETTLE_OPTIMAL_LIMIT", value)
     with pytest.raises(ValidationError):
         AppSettings()
+
+
+# ---------------------------------------------------------------- 송금 완료 (6단계)
+
+
+def complete(client, gid, headers, sid, line_no, key=None):
+    h = {**headers, "Idempotency-Key": key or str(uuid.uuid4())}
+    return client.post(
+        f"/api/groups/{gid}/settlements/{sid}/transfers/{line_no}/complete", json={}, headers=h
+    )
+
+
+def confirmed_with_two_transfers(client):
+    gid, headers, ids = setup_group(client)
+    add_expense(client, gid, headers, ids)  # 민수 30,000원, 셋이 나눔 -> 송금 2줄
+    settlement = confirm(client, gid, headers, plan(client, gid, headers)["version"]).json()
+    assert len(settlement["transfers"]) == 2
+    return gid, headers, ids, settlement
+
+
+def get_settlement(client, gid, headers, sid):
+    return client.get(f"/api/groups/{gid}/settlements/{sid}", headers=headers).json()
+
+
+def test_completing_every_transfer_settles_the_group(client):
+    gid, headers, _, settlement = confirmed_with_two_transfers(client)
+    sid = settlement["id"]
+    first = complete(client, gid, headers, sid, 1)
+    assert first.status_code == 201, first.text
+    entry = first.json()
+    planned = settlement["transfers"][0]
+    assert (entry["kind"], entry["settlement_id"], entry["settlement_line_no"]) == (
+        "TRANSFER",
+        sid,
+        1,
+    )
+    sender = next(ln for ln in entry["lines"] if ln["side"] == "CREDIT")
+    assert (sender["member_id"], sender["amount"]) == (planned["sender_id"], planned["amount"])
+
+    after_one = get_settlement(client, gid, headers, sid)
+    assert [t["completed_entry_id"] for t in after_one["transfers"]] == [entry["id"], None]
+    assert after_one["completed"] is False
+
+    complete(client, gid, headers, sid, 2)
+    done = get_settlement(client, gid, headers, sid)
+    assert done["completed"] is True
+    balances = client.get(f"/api/groups/{gid}/balances", headers=headers).json()["balances"]
+    assert {b["amount"] for b in balances} == {"0"}
+
+
+def test_transfer_line_cannot_be_completed_twice(client):
+    gid, headers, _, settlement = confirmed_with_two_transfers(client)
+    sid = settlement["id"]
+    assert complete(client, gid, headers, sid, 1, key="c1").status_code == 201
+    retry = complete(client, gid, headers, sid, 1, key="c1")  # 같은 키 = 재시도
+    assert retry.status_code == 201 and retry.headers["Idempotent-Replayed"] == "true"
+    again = complete(client, gid, headers, sid, 1)  # 다른 키 = 두 번째 완료
+    assert again.status_code == 409
+    assert again.json()["error"] == "TransferAlreadyCompletedError"
+
+
+def test_reversing_a_completion_reopens_the_line(client):
+    gid, headers, _, settlement = confirmed_with_two_transfers(client)
+    sid = settlement["id"]
+    entry = complete(client, gid, headers, sid, 1).json()
+    h = {**headers, "Idempotency-Key": str(uuid.uuid4())}
+    res = client.post(f"/api/groups/{gid}/entries/{entry['id']}/reversal", json={}, headers=h)
+    assert res.status_code == 201
+    assert get_settlement(client, gid, headers, sid)["transfers"][0]["completed_entry_id"] is None
+    again = complete(client, gid, headers, sid, 1)  # 취소했으니 다시 완료할 수 있다
+    assert again.status_code == 201
+    assert (
+        get_settlement(client, gid, headers, sid)["transfers"][0]["completed_entry_id"]
+        == (again.json()["id"])
+    )
+
+
+@pytest.mark.parametrize("line_no", [0, 3])
+def test_unknown_transfer_line_is_404(client, line_no):
+    gid, headers, _, settlement = confirmed_with_two_transfers(client)
+    res = complete(client, gid, headers, settlement["id"], line_no)
+    assert res.status_code == 404
+    assert res.json()["error"] == "SettlementNotFoundError"
+
+
+def test_settlement_without_transfers_is_complete_from_the_start(client):
+    gid, headers, _ = setup_group(client)
+    assert confirm(client, gid, headers, 0).json()["completed"] is True
+
+
+def test_concurrent_completions_of_one_line_record_one_transfer(db):
+    """다른 키로 같은 줄을 동시에 완료해도 송금은 하나. 그룹 잠금 아래의 검사가 막는다."""
+    krw = get_currency("KRW")
+    group = store.create_group(db, "모임", krw, store.hash_bytes(b"complete"))
+    ids = [member_key(store.add_member(db, group.id, n).id) for n in ("a", "b")]
+    entry = expense_entry(ids[0], Money.of(1000, krw), EqualSplit(ids))
+    store.post_entry(db, group, lambda _c, _s: entry, "e", store.hash_bytes(b"e"))
+    settlement, _ = store.confirm_settlement(db, group, 1, Strategy.AUTO)
+
+    n = 4
+    start = threading.Barrier(n)
+    outcomes: list[str] = []
+
+    def worker(i: int) -> None:
+        start.wait(timeout=10)
+        build = store.completion_builder(group, settlement.id, 1, "")
+        try:
+            store.post_entry(
+                db,
+                group,
+                build,
+                f"k{i}",
+                store.hash_bytes(f"k{i}".encode()),
+                link=(settlement.id, 1),
+            )
+            outcomes.append("ok")
+        except store.TransferAlreadyCompletedError:
+            outcomes.append("conflict")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert sorted(outcomes) == ["conflict"] * (n - 1) + ["ok"]
+    assert len(store.get_settlement(db, group, settlement.id).completions) == 1

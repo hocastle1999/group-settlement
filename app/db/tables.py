@@ -110,6 +110,10 @@ journal_entries = Table(
     Column("original_currency", String(3), nullable=True),
     Column("original_amount", AMOUNT, nullable=True),
     Column("fx_rate", FX_RATE, nullable=True),
+    # 확정 정산의 송금 한 줄을 "보냈다"로 처리한 송금이면 그 줄 (6단계). 줄의 상태를 UPDATE하지 않고
+    # 이 연결로 완료를 나타낸다. 완료 = 그 줄을 가리키는 송금이 있고 취소되지 않았다.
+    Column("settlement_id", BigInteger, nullable=True),
+    Column("settlement_line_no", SmallInteger, nullable=True),
     Column("created_at", DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     ForeignKeyConstraint(["group_id"], ["settlement_groups.id"]),
     UniqueConstraint("group_id", "id"),
@@ -134,6 +138,19 @@ journal_entries = Table(
         name="fx_all_or_none",
     ),
     CheckConstraint("original_currency IS NULL OR kind = 'EXPENSE'", name="fx_only_expense"),
+    ForeignKeyConstraint(
+        ["group_id", "settlement_id", "settlement_line_no"],
+        [
+            "settlement_transfers.group_id",
+            "settlement_transfers.settlement_id",
+            "settlement_transfers.line_no",
+        ],
+    ),
+    Index(None, "group_id", "settlement_id", "settlement_line_no"),
+    CheckConstraint(
+        "(settlement_id IS NULL) = (settlement_line_no IS NULL)", name="settlement_link_both"
+    ),
+    CheckConstraint("settlement_id IS NULL OR kind = 'TRANSFER'", name="settlement_link_transfer"),
 )
 
 entry_lines = Table(

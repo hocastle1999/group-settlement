@@ -134,6 +134,9 @@ class EntryOut(BaseModel):
     reverses_entry_id: int | None
     reversed_by_entry_id: int | None
     original: OriginalOut | None
+    # 확정 정산의 송금을 완료한 기록이면 (정산 id, 줄 번호). 아니면 null.
+    settlement_id: int | None
+    settlement_line_no: int | None
     created_at: datetime
     lines: list[LineOut]
 
@@ -174,6 +177,16 @@ class SettlementConfirm(Request):
     strategy: Strategy = Strategy.AUTO
 
 
+class ConfirmedTransferOut(TransferOut):
+    line_no: int  # 완료 처리할 때 쓰는 줄 번호 (1부터)
+    # 이 줄을 완료한 송금 분개 id. 아직 안 보냈거나 완료를 취소했으면 null.
+    completed_entry_id: int | None
+
+
+class CompletionCreate(Request):
+    memo: Memo = ""
+
+
 class ConfirmedSettlementOut(BaseModel):
     id: int
     version: int
@@ -182,7 +195,9 @@ class ConfirmedSettlementOut(BaseModel):
     currency: str
     strategy: Strategy
     created_at: datetime
-    transfers: list[TransferOut]
+    transfers: list[ConfirmedTransferOut]
+    # 모든 송금 줄이 완료됐는지 (송금이 하나도 없는 정산은 처음부터 완료)
+    completed: bool
 
 
 class ConfirmedSettlementList(BaseModel):
