@@ -32,6 +32,15 @@ class Request(BaseModel):
 # ---------------------------------------------------------------- 그룹, 멤버
 
 
+class CurrencyOut(BaseModel):
+    code: str
+    exponent: int  # 소수 자릿수 (KRW 0, USD 2, KWD 3)
+
+
+class CurrencyList(BaseModel):
+    currencies: list[CurrencyOut]
+
+
 class GroupCreate(Request):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     currency: CurrencyCode  # type: ignore[valid-type]

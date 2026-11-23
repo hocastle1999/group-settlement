@@ -26,6 +26,7 @@ from app.api.auth import (
 from app.db import audit, report, store
 from app.db.store import Group, PostResult, StoredEntry, member_key
 from app.ledger import (
+    CURRENCIES,
     Currency,
     EqualSplit,
     FixedSplit,
@@ -49,6 +50,17 @@ IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ---------------------------------------------------------------- 그룹, 멤버
+
+
+@router.get("/currencies", response_model=s.CurrencyList)
+def list_currencies() -> s.CurrencyList:
+    """지원 통화와 소수 자릿수. 데모 페이지가 통화 선택지를 만들 때 쓴다(목록을 한 곳에서 관리)."""
+    return s.CurrencyList(
+        currencies=[
+            s.CurrencyOut(code=c.code, exponent=c.exponent)
+            for c in sorted(CURRENCIES.values(), key=lambda c: c.code)
+        ]
+    )
 
 
 @router.post("/groups", status_code=status.HTTP_201_CREATED, response_model=s.GroupCreated)

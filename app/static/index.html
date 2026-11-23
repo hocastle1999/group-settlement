@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>모임 정산</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #667085; --line: #e4e7ec;
+    --accent: #2f6fed; --good: #12805c; --bad: #c4320a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2129; --text: #e6e8ec; --muted: #98a2b3; --line: #2e3440;
+            --accent: #6d9bff; --good: #47c79a; --bad: #ff8466; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  form { display: grid; gap: 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row > * { flex: 1 1 120px; }
+  input, select, button { font: inherit; padding: 7px 9px; border-radius: 7px;
+                          border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  button { background: var(--accent); color: #fff; border: 0; cursor: pointer; flex: 0 0 auto; }
+  button.small { padding: 3px 8px; font-size: 13px; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 5px 4px; border-bottom: 1px solid var(--line); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--good); } .neg { color: var(--bad); }
+  .tag { font-size: 12px; padding: 1px 6px; border-radius: 9px; border: 1px solid var(--line); }
+  .cancelled { opacity: .5; text-decoration: line-through; }
+  #toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); max-width: 90%;
+           padding: 9px 14px; border-radius: 8px; background: var(--text); color: var(--bg); display: none; }
+  .wide { grid-column: 1 / -1; }
+  code { font-size: 12px; word-break: break-all; }
+  label.check { display: inline-flex; gap: 4px; align-items: center; margin-right: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>모임 정산</h1>
+  <p class="muted">이중기입 원장으로 기록하고, 송금 횟수가 가장 적은 정산 계획을 계산합니다.
+    초대 링크(<code>#g=...&amp;t=...</code>)를 가진 사람이 그룹을 함께 씁니다.</p>
+
+  <!-- 그룹이 없을 때 -->
+  <section id="create-view" hidden>
+    <h2>새 모임 만들기</h2>
+    <form id="create-form">
+      <div class="row">
+        <input name="name" placeholder="모임 이름 (예: 제주 여행)" required maxlength="100">
+        <select name="currency" id="create-currency"></select>
+        <button>만들기</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- 그룹이 있을 때 -->
+  <div id="group-view" hidden>
+    <section class="wide" style="margin-bottom:12px">
+      <div class="row">
+        <div><strong id="group-name"></strong> <span class="tag" id="group-currency"></span>
+          <span class="muted" id="group-version"></span></div>
+        <label class="muted" style="flex:0 0 auto">나는
+          <select id="actor"><option value="">(밝히지 않음)</option></select></label>
+        <button class="ghost" id="copy-link">초대 링크 복사</button>
+      </div>
+      <p class="muted" style="margin:6px 0 0">초대 링크의 # 뒤 토큰은 서버로 전송되지 않습니다(접근 로그에 남지 않음).
+        "나는"은 감사 로그에 남는 이름일 뿐 인증이 아닙니다.</p>
+    </section>
+
+    <div class="grid">
+      <section>
+        <h2>멤버</h2>
+        <form id="member-form"><div class="row">
+          <input name="name" placeholder="이름" required maxlength="50"><button>추가</button>
+        </div></form>
+        <table><thead><tr><th>이름</th><th class="num">잔액</th></tr></thead>
+          <tbody id="balances"></tbody></table>
+        <p class="muted">+ 돌려받을 돈, - 낼 돈. 합은 항상 0.</p>
+      </section>
+
+      <section>
+        <h2>지출 기록</h2>
+        <form id="expense-form">
+          <div class="row">
+            <select name="payer" class="member-select" required></select>
+            <input name="amount" placeholder="금액 (예: 30000)" required inputmode="decimal">
+          </div>
+          <div class="row">
+            <select name="currency" id="expense-currency"></select>
+            <input name="fx_rate" id="fx-rate" placeholder="환율 (1 외화당 기준 통화)" hidden inputmode="decimal">
+          </div>
+          <div id="participants" class="muted"></div>
+          <div class="row"><input name="memo" placeholder="메모" maxlength="200"><button>기록</button></div>
+        </form>
+      </section>
+
+      <section>
+        <h2>송금 기록</h2>
+        <form id="transfer-form">
+          <div class="row">
+            <select name="sender" class="member-select" required></select>
+            <span style="flex:0 0 auto">→</span>
+            <select name="receiver" class="member-select" required></select>
+          </div>
+          <div class="row"><input name="amount" placeholder="금액" required inputmode="decimal"><button>기록</button></div>
+        </form>
+      </section>
+
+      <section>
+        <h2>정산 계획</h2>
+        <div id="plan"></div>
+        <div class="row" style="margin-top:8px"><button id="confirm">이 계획으로 확정</button></div>
+        <p class="muted">확정하는 사이 다른 기록이 생기면 거절되고(409) 새 계획을 다시 보여 줍니다.</p>
+      </section>
+
+      <section class="wide">
+        <h2>확정된 정산</h2>
+        <div id="settlements" class="muted">아직 없음</div>
+      </section>
+
+      <section class="wide">
+        <h2>기록</h2>
+        <table><thead><tr><th>#</th><th>종류</th><th>내용</th><th class="num">금액</th><th></th></tr></thead>
+          <tbody id="entries"></tbody></table>
+      </section>
+
+      <section class="wide">
+        <h2>리포트</h2>
+        <table><thead><tr><th>이름</th><th class="num">낸 돈</th><th class="num">몫</th>
+          <th class="num">보냄</th><th class="num">받음</th><th class="num">잔액</th></tr></thead>
+          <tbody id="report-members"></tbody></table>
+        <div class="grid" style="margin-top:10px">
+          <div><h2>날짜별 지출</h2><table><tbody id="report-daily"></tbody></table></div>
+          <div><h2>통화별 지출</h2><table><tbody id="report-currency"></tbody></table></div>
+        </div>
+      </section>
+
+      <section class="wide">
+        <div class="row"><h2 style="margin:0">감사 로그</h2>
+          <button class="ghost small" id="verify" style="flex:0 0 auto">해시 체인 검증</button>
+          <span id="verify-result" class="muted"></span></div>
+        <table><tbody id="audit"></tbody></table>
+      </section>
+    </div>
+  </div>
+</main>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api import errors
 from app.api.routes import router
@@ -25,6 +28,9 @@ async def json_charset_utf8(request: Request, call_next):
     if response.headers.get("content-type") == "application/json":
         response.headers["content-type"] = "application/json; charset=utf-8"
     return response
+
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def create_app(
@@ -48,6 +54,23 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # 데모 페이지 (6단계). 스크립트는 파일로만 받는다: CSP가 페이지 안의 인라인 스크립트를 막아,
+    # 누가 기록(메모, 이름)에 스크립트를 넣어도 실행되지 않게 한 겹 더 막는다.
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def demo_page() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "index.html",
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+                ),
+                "Referrer-Policy": "no-referrer",
+            },
+        )
 
     return app
 

@@ -63,3 +63,16 @@ jobs:
         env:
           DB_NAME: group_settlement_test
         run: alembic check
+
+      # 배포와 같은 명령으로 서버를 띄워 데모 페이지와 API가 실제로 응답하는지 확인한다.
+      - name: Smoke test (server starts)
+        env:
+          DB_NAME: group_settlement_test
+        run: |
+          uvicorn app.main:app --port 8000 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8000/ | grep -q "모임 정산"
+          curl -fsS http://127.0.0.1:8000/static/app.js > /dev/null
+          curl -fsS -X POST http://127.0.0.1:8000/api/groups \
+            -H "Content-Type: application/json" \
+            -d '{"name": "smoke", "currency": "KRW"}' | grep -q invite_token

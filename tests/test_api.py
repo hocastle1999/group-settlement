@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from decimal import Decimal
 
@@ -388,3 +389,25 @@ def test_app_never_updates_or_deletes_ledger_rows(client, db):
     assert writes
     assert all(s.startswith("UPDATE SETTLEMENT_GROUPS SET") for s in writes), writes
     assert any(s.startswith("INSERT INTO AUDIT_EVENTS") for s in statements)
+
+
+# ---------------------------------------------------------------- 데모 페이지 (6단계)
+
+
+def test_demo_page_is_served_with_security_headers(client):
+    res = client.get("/")
+    assert res.status_code == 200
+    assert "모임 정산" in res.text
+    csp = res.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp and "script-src" not in csp  # 인라인 스크립트 금지
+    assert res.headers["Referrer-Policy"] == "no-referrer"
+    js = client.get("/static/app.js")
+    assert js.status_code == 200
+    # 사용자 입력은 textContent로만 넣는다: HTML로 해석하는 대입이 없어야 한다
+    assert not re.search(r"\.(innerHTML|outerHTML)\s*=|insertAdjacentHTML", js.text)
+
+
+def test_currencies_endpoint_lists_supported_currencies(client):
+    body = client.get("/api/currencies").json()
+    by_code = {c["code"]: c["exponent"] for c in body["currencies"]}
+    assert by_code["KRW"] == 0 and by_code["USD"] == 2 and by_code["KWD"] == 3
