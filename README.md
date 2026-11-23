@@ -21,6 +21,7 @@
 | DB 정합성 | `CHECK (amount > 0)`, 역분개 대상 유니크, 복합 외래 키 | 코어를 거치지 않은 쓰기나 동시 요청도 규칙을 못 깬다 |
 | 동시 쓰기 | 그룹 행 `FOR UPDATE` + 그룹별 순번, 정산 확정은 원장 버전 비교 | id 순서는 커밋 순서가 아니다. "확정한 계획 = 그 버전의 원장"이 동시 지출에도 지켜진다 |
 | 외화 | 지출 시점 환율로 총액을 한 번 환산, 원래 금액·환율은 증빙 | 원장은 통화 하나라 기존 규칙이 그대로. 사람마다 환산하면 반올림이 쌓여 합이 어긋난다 |
+| 감사 로그 | 바뀌는 내용과 같은 트랜잭션, 행마다 SHA-256 해시 체인 | 기록 없는 변경이 없고, DB에서 몰래 고치거나 지우면 검증이 잡는다 (체인 전체 재계산은 못 막음: 한계로 문서화) |
 | 잔액 | 매번 SUM + 커버링 인덱스 (잔액 테이블 없음) | 실험: 잔액 테이블은 빠르지만 갱신 손실, 데드락, 두 원천의 어긋남을 관리해야 한다 |
 
 자세한 내용은 [docs/design.md](docs/design.md).
@@ -32,7 +33,7 @@
 3. [x] **DB 스키마 + REST API**: MySQL, 추가만 하는 원장 테이블, CHECK 제약, 멱등성 키, 초대 링크 토큰. 규칙은 코어를 재사용하고 SQL 잔액을 메모리 원장과 비교 테스트
 4. [x] **동시성·정합성**: 그룹별 순번과 행 잠금(AUTO_INCREMENT ≠ 커밋 순서), 버전을 확인하는 정산 확정(409), 매번 합산 vs 잔액 테이블 실험 -> 커버링 인덱스로 1만 줄 25ms -> 7ms ([실험](docs/experiments.md#4단계-잔액-계산-방식과-동시성))
 5. [x] **다중 통화**: 지출 시점 환율로 기준 통화에 한 번 환산(ROUND_HALF_EVEN), 원래 금액과 환율은 증빙으로 저장, 외화 정액 분할도 합이 정확. 남는 1원을 분개 순번만큼 돌려 배분
-6. [ ] **정산 확정·송금 완료**: 감사 로그, 리포트 SQL, 데모 페이지
+6. [x] **송금 완료·감사 로그·리포트·데모**: 송금 완료를 분개로 기록(그룹 잠금으로 중복 방지), 해시 체인 감사 로그(변조 감지), 리포트 SQL(조건부 집계, 윈도 함수), 데모 한 페이지
 7. [ ] **배포**
 
 ## 실행 (Windows PowerShell)
@@ -48,7 +49,7 @@ Copy-Item .env.example .env
 .\.venv\Scripts\alembic.exe upgrade head
 
 .\.venv\Scripts\python.exe -m pytest -q                    # 테스트 (group_settlement_test DB 사용)
-.\.venv\Scripts\python.exe -m uvicorn app.main:app         # API 서버, 문서: http://localhost:8000/docs
+.\.venv\Scripts\python.exe -m uvicorn app.main:app         # 데모 페이지 http://localhost:8000 , API 문서 /docs
 .\.venv\Scripts\python.exe -m scripts.compare_settlement   # 그리디 vs 최적 실험
 ```
 
