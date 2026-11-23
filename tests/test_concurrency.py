@@ -7,15 +7,27 @@
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 
 from sqlalchemy import Engine, func, insert, select
 
 from app.db import store
-from app.db.store import Group, member_key
+from app.db.store import Group, StaleVersionError, member_key
 from app.db.tables import journal_entries, settlement_groups
-from app.ledger import Money, get_currency, transfer_entry
+from app.ledger import (
+    AlreadyReversedError,
+    EntryKind,
+    EqualSplit,
+    Money,
+    RatioSplit,
+    Side,
+    Strategy,
+    expense_entry,
+    get_currency,
+    transfer_entry,
+)
 
 KRW = get_currency("KRW")
 
@@ -160,3 +172,119 @@ def test_concurrent_writes_get_gapless_seq_in_commit_order(db):
     assert last_seq == total
     # 잠금 아래에서 INSERT하므로 id 순서도 seq 순서와 같다 (id를 받은 순서 = 커밋 순서)
     assert [r.id for r in rows] == sorted(r.id for r in rows)
+
+
+# ---------------------------------------------------------------- 스트레스: 섞인 작업 뒤 불변식
+
+
+def test_mixed_concurrent_operations_keep_every_invariant(db):
+    """여러 스레드가 지출, 송금, 취소, 정산 확정을 섞어 보낸 뒤 전체 이력을 검사한다.
+
+    - 순번은 1..last_seq, 빈 번호도 중복도 없다
+    - 한 분개는 한 번만 취소되고, 역분개는 취소되지 않았다
+    - 잔액 합은 0이고, SQL 잔액 = 분개 줄을 파이썬으로 다시 더한 값
+    - 모든 확정 정산 = "그 버전까지의 분개"만으로 다시 계산한 계획
+    """
+    group, ids = make_group(db, b"stress")
+    for name in ("c", "d", "e"):
+        ids.append(member_key(store.add_member(db, group.id, name).id))
+    n_threads, ops = 8, 25
+    start = threading.Barrier(n_threads + 1)
+    writers_done = threading.Event()
+    errors: list[Exception] = []
+    counts = {"stale": 0, "already_reversed": 0, "confirmed": 0}
+    lock = threading.Lock()
+
+    def write_one(rng: random.Random, key: str) -> None:
+        op = rng.random()
+        if op < 0.2:
+            recent = store.list_entries(db, group.id, 20)
+            if recent:
+                build = store.reversal_builder(group, rng.choice(recent).id, "")
+                store.post_entry(db, group, build, key, store.hash_bytes(key.encode()))
+            return
+        if op < 0.45:
+            a, b = rng.sample(ids, 2)
+            e = transfer_entry(a, b, Money.of(rng.randint(1, 50_000), KRW))
+        else:
+            people = rng.sample(ids, rng.randint(2, len(ids)))
+            amount = Money.of(rng.randint(1, 100_000), KRW)
+            split = (
+                EqualSplit(people)
+                if rng.random() < 0.5
+                else RatioSplit({p: rng.randint(1, 4) for p in people})
+            )
+            e = expense_entry(people[0], amount, split)
+        store.post_entry(db, group, lambda _c: e, key, store.hash_bytes(key.encode()))
+
+    def writer(t: int) -> None:
+        rng = random.Random(t)
+        try:
+            start.wait(timeout=10)
+            for i in range(ops):
+                try:
+                    write_one(rng, f"s{t}-{i}")
+                except AlreadyReversedError:  # 이미 취소됐거나 역분개를 고름: 정상 거절
+                    with lock:
+                        counts["already_reversed"] += 1
+        except Exception as exc:  # pragma: no cover - 실패 시 원인 표시용
+            errors.append(exc)
+
+    def try_confirm() -> None:
+        version = store.current_version(db, group)
+        try:
+            store.confirm_settlement(db, group, version, Strategy.AUTO)
+            counts["confirmed"] += 1
+        except StaleVersionError:
+            counts["stale"] += 1
+
+    def confirmer() -> None:
+        # 쓰기가 계속되는 동안 확정을 계속 시도한다. 쓰기가 쉬지 않으면 대부분 409다
+        # (버전을 읽는 사이 다른 쓰기가 먼저 잠금을 잡는다, docs/experiments.md 4단계).
+        try:
+            start.wait(timeout=10)
+            while not writers_done.is_set():
+                try_confirm()
+            try_confirm()  # 조용해진 뒤에는 반드시 성공한다
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(t,)) for t in range(n_threads)]
+    confirm_thread = threading.Thread(target=confirmer)
+    for t in [*threads, confirm_thread]:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    writers_done.set()
+    confirm_thread.join(timeout=30)
+    assert not errors, errors
+    assert counts["confirmed"] >= 1, counts
+
+    entries = sorted(store.list_entries(db, group.id, 10_000), key=lambda e: e.seq)
+    last_seq = store.current_version(db, group)
+    # 1. 순번
+    assert [e.seq for e in entries] == list(range(1, last_seq + 1))
+    # 2. 취소
+    by_id = {e.id: e for e in entries}
+    targets = [e.reverses_entry_id for e in entries if e.kind is EntryKind.REVERSAL]
+    assert len(targets) == len(set(targets))
+    assert all(by_id[t].kind is not EntryKind.REVERSAL for t in targets)
+
+    # 3. 잔액
+    def replay(upto: int) -> dict[int, Money]:
+        totals = {int(m): Money.zero(KRW) for m in ids}
+        for e in entries:
+            if e.seq > upto:
+                break
+            for ln in e.lines:
+                delta = ln.amount if ln.side is Side.CREDIT else -ln.amount
+                totals[ln.member_id] = totals[ln.member_id] + delta
+        return totals
+
+    assert store.balances(db, group) == replay(last_seq)
+    # 4. 확정 정산
+    confirmed = store.list_settlements(db, group, 100)
+    assert len(confirmed) == len({s.version for s in confirmed})
+    for settlement in confirmed:
+        expected = store.plan_settlement(replay(settlement.version), settlement.strategy)
+        assert list(settlement.transfers) == expected, settlement.version
