@@ -10,7 +10,7 @@
   - 기능 단위로 작게 나눠 진행하고 커밋도 그 단위로 나눈다 (한국어 conventional commit).
 - 실제로 겪은 문제는 `docs/troubleshooting.md`에 문제, 원인, 해결, 배운 점으로 남긴다.
 - 설계 결정은 `docs/design.md`, 실험 결과는 `docs/experiments.md`에 남긴다.
-- 진행 단계는 README "로드맵"을 따른다. 현재 6단계 완료 (남은 것: 7단계 배포).
+- 진행 단계는 README "로드맵"을 따른다. 현재 6단계 완료, 7단계(배포)는 준비까지 완료(`render.yaml`, docs/deploy.md). 실제 배포(GitHub 저장소, MySQL, Render 전용 워크스페이스)는 사용자가 보류했다.
 - 범위 결정: 인증은 그룹별 초대 링크 토큰(회원가입 없음), 화면은 REST API + 데모 한 페이지. 다중 통화는 "지출 시점 환율로 기준 통화에 환산, 원장은 통화 하나"(5단계).
 - GitHub 저장소 생성과 push는 사용자에게 먼저 묻는다.
 - 사용자와의 대화와 문서는 한국어로 작성한다. 코드 식별자는 영어, 주석은 한국어로 쓴다.
@@ -26,7 +26,7 @@
 - 가상환경 Python: `.\.venv\Scripts\python.exe`
 - 의존성 설치: `.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt`
 - 테스트: `.\.venv\Scripts\python.exe -m pytest -q` (CI와 같은 고정 시드: `$env:CI=1` 후 실행). DB 테스트는 `group_settlement_test`를 쓴다.
-- 서버: `.\.venv\Scripts\python.exe -m uvicorn app.main:app` (데모 페이지 http://localhost:8000 , 문서 /docs)
+- 서버: `.\.venv\Scripts\python.exe -m uvicorn app.main:app --no-proxy-headers` (데모 페이지 http://localhost:8000 , 문서 /docs). `--no-proxy-headers`를 빼면 uvicorn이 127.0.0.1에서 온 X-Forwarded-For를 믿어 빈도 제한을 위조로 피할 수 있다(docs/troubleshooting.md).
 - DB 준비(최초 1회): root로 `scripts/init_db.sql` 실행(비밀번호를 바꿔서, 바꾼 사본은 `*.local.sql`) → `.env.example`을 `.env`로 복사 → `.\.venv\Scripts\alembic.exe upgrade head`
 - 스키마 변경: `app/db/tables.py` 수정 → `.\.venv\Scripts\alembic.exe revision --autogenerate -m "설명"` → 생성 파일을 읽고 고친 뒤 `upgrade head` → `downgrade -1` → `upgrade head` 왕복, `alembic.exe check`로 모델과 DB 일치 확인 (CI도 `alembic check`)
   - `alembic.ini`는 ASCII만 쓴다 (Windows에서 cp949로 읽혀 한글이 깨진다).
@@ -69,7 +69,9 @@
   - 분개를 만드는 쓰기(지출, 송금, 취소)는 `Idempotency-Key` 필수. 요청 지문은 메서드 + 경로 + 정렬한 JSON 본문.
   - 새 예외를 추가하면 `app/api/errors.py`의 `STATUS_BY_ERROR`에 넣는다(없으면 500).
 - `app/static/`: 데모 페이지(`index.html`, `app.js`). 그룹 id와 토큰은 URL fragment(`#g=..&t=..`). 사용자 입력은 `textContent`로만(innerHTML 금지, 테스트가 검사), 페이지에 CSP. 화면을 바꾸면 브라우저로 직접 눌러 확인한다.
-- `app/config.py`: `AppSettings`(`SETTLE_OPTIMAL_LIMIT`, 1 ~ 20). 새 설정을 추가하면 `.env.example`과 README 환경 변수 표도 갱신한다.
+- `app/config.py`: `AppSettings`(`SETTLE_OPTIMAL_LIMIT` 1 ~ 20, `RATE_LIMIT_*`, `TRUSTED_PROXY_HOPS`). `app/db/config.py`: `DB_SSL`(인증서 검증), `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`. 새 설정을 추가하면 `.env.example`과 README 환경 변수 표도 갱신한다.
+- `app/api/rate_limit.py`: 쓰기 빈도 제한(슬라이딩 윈도 로그, 서버 메모리). 접속자 IP는 `client_ip`로만 구한다(X-Forwarded-For 왼쪽 값을 믿지 않는다). 테스트 환경은 conftest가 끄고 `test_rate_limit.py`가 따로 검사한다.
+- `render.yaml`: 웹 서비스 하나(빈도 제한이 메모리에 있다). 시작 명령이 마이그레이션을 먼저 돈다. 시작 명령을 바꾸면 CI의 Smoke test도 같이 바꾼다. 배포는 이 프로젝트 전용 Render 워크스페이스에서 한다(기존 워크스페이스의 무료 시간을 다른 서비스와 나눠 쓰지 않게).
 - `app/main.py`: `create_app(db_settings, settings)`. JSON 응답에 `charset=utf-8`을 붙이는 미들웨어(PowerShell 5.1 한글 깨짐, docs/troubleshooting.md).
 - `scripts/compare_balances.py`: 잔액 계산 방식(SUM, 커버링 인덱스, 잔액 테이블)과 동시성(갱신 손실, 데드락, 확정 굶주림) 실험. **테스트 DB를 비운다**(테스트와 동시에 돌리지 않는다). 결과는 docs/experiments.md.
 - `scripts/compare_settlement.py`: 그리디 vs 최적 실험(`python -m scripts.compare_settlement`). 난수는 `random.Random(seed)`만. 결과는 docs/experiments.md에 옮긴다.

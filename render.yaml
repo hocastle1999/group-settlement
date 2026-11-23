@@ -1,0 +1,44 @@
+# Render Blueprint: 데모 배포 (웹 서비스 하나 + 외부 MySQL 8.0). 자세한 내용은 docs/deploy.md.
+# Render는 관리형 MySQL을 제공하지 않는다(PostgreSQL만). DB는 바깥에 두고 DB_* 값을 대시보드에서 넣는다.
+services:
+  - type: web
+    name: group-settlement
+    runtime: python  # 버전은 .python-version(3.11)을 따른다
+    plan: free
+    region: singapore  # 한국에서 가장 가까운 지역
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    # 시작할 때 마이그레이션을 먼저 올린다. 인스턴스 하나라 두 프로세스가 동시에 돌릴 일이 없다.
+    # (여러 대가 되면 배포 전 단계(preDeployCommand)로 옮긴다. 무료 인스턴스에서 되는지는 배포 때 확인)
+    # 마이그레이션이 실패하면 서버가 뜨지 않는다. MySQL DDL은 롤백되지 않으므로 로그와
+    # alembic current부터 확인한다 (docs/troubleshooting.md).
+    # --no-proxy-headers: X-Forwarded-For는 앱이 TRUSTED_PROXY_HOPS로 직접 해석한다 (위조 방지).
+    # 이 명령을 바꾸면 CI의 Smoke test도 같이 바꾼다.
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-proxy-headers
+    healthCheckPath: /health
+    envVars:
+      # 접속 정보는 대시보드에서 직접 넣는다 (sync: false = 저장소에 값을 두지 않는다)
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_SSL
+        value: "true"
+      # 무료 MySQL의 작은 연결 한도에 맞춘다 (최대 5개)
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+      # Render 앞단 프록시 1개. 배포 뒤 429 응답의 기준 IP가 실제 공인 IP인지 확인한다.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      # 무료 인스턴스는 CPU가 로컬보다 훨씬 느리다. 최적 정산 DP를 14명까지만 (로컬 8ms).
+      - key: SETTLE_OPTIMAL_LIMIT
+        value: "14"

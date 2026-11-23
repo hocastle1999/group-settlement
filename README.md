@@ -34,7 +34,7 @@
 4. [x] **동시성·정합성**: 그룹별 순번과 행 잠금(AUTO_INCREMENT ≠ 커밋 순서), 버전을 확인하는 정산 확정(409), 매번 합산 vs 잔액 테이블 실험 -> 커버링 인덱스로 1만 줄 25ms -> 7ms ([실험](docs/experiments.md#4단계-잔액-계산-방식과-동시성))
 5. [x] **다중 통화**: 지출 시점 환율로 기준 통화에 한 번 환산(ROUND_HALF_EVEN), 원래 금액과 환율은 증빙으로 저장, 외화 정액 분할도 합이 정확. 남는 1원을 분개 순번만큼 돌려 배분
 6. [x] **송금 완료·감사 로그·리포트·데모**: 송금 완료를 분개로 기록(그룹 잠금으로 중복 방지), 해시 체인 감사 로그(변조 감지), 리포트 SQL(조건부 집계, 윈도 함수), 데모 한 페이지
-7. [ ] **배포**
+7. [ ] **배포**: 준비 완료(`render.yaml`, TLS·연결 풀·빈도 제한 설정, CI 스모크 테스트). 실제 배포는 보류 ([배포 문서](docs/deploy.md))
 
 ## 실행 (Windows PowerShell)
 
@@ -49,7 +49,7 @@ Copy-Item .env.example .env
 .\.venv\Scripts\alembic.exe upgrade head
 
 .\.venv\Scripts\python.exe -m pytest -q                    # 테스트 (group_settlement_test DB 사용)
-.\.venv\Scripts\python.exe -m uvicorn app.main:app         # 데모 페이지 http://localhost:8000 , API 문서 /docs
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --no-proxy-headers   # 데모 http://localhost:8000 , API 문서 /docs
 .\.venv\Scripts\python.exe -m scripts.compare_settlement   # 그리디 vs 최적 실험
 ```
 
@@ -61,6 +61,11 @@ Copy-Item .env.example .env
 | `DB_USER` | `group_settlement_app` | |
 | `DB_PASSWORD` | (없음) | `scripts/init_db.sql`에 넣은 값 |
 | `SETTLE_OPTIMAL_LIMIT` | `16` | 정산 AUTO가 최적(비트마스크 DP)을 쓰는 최대 인원 (1 ~ 20) |
+| `DB_SSL` | `false` | 외부 MySQL에 TLS로 붙는다(인증서, 호스트 이름 검증) |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW` | `5`, `5` | 연결 풀 (최대 연결 = 둘의 합) |
+| `RATE_LIMIT_GROUPS_PER_HOUR` | `10` | 접속자 IP마다 그룹 만들기 한도 (0이면 끔) |
+| `RATE_LIMIT_WRITES_PER_MINUTE` | `60` | 그 밖의 쓰기(POST) 한도 |
+| `TRUSTED_PROXY_HOPS` | `0` | 앞단 프록시 수 (Render는 1). X-Forwarded-For를 오른쪽에서 센다 |
 
 ## 사용 예 (REST API)
 
