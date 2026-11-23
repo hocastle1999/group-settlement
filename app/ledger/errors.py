@@ -13,6 +13,10 @@ class CurrencyMismatchError(LedgerError):
     """서로 다른 통화를 섞어 계산하려 했다."""
 
 
+class InvalidExchangeRateError(LedgerError):
+    """환율이 잘못됐다 (0 이하, 소수 자릿수 초과, float 등)."""
+
+
 class InvalidSplitError(LedgerError):
     """분할 규칙이 잘못됐다 (참여자 없음, 정액 합계 불일치 등)."""
 

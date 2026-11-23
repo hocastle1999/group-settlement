@@ -5,6 +5,7 @@ from app.ledger.errors import (
     CurrencyMismatchError,
     EntryNotFoundError,
     InvalidAmountError,
+    InvalidExchangeRateError,
     InvalidSplitError,
     LedgerError,
     TooManyMembersError,
@@ -12,6 +13,7 @@ from app.ledger.errors import (
     UnbalancedEntryError,
     UnknownMemberError,
 )
+from app.ledger.fx import ForeignAmount, convert
 from app.ledger.ledger import (
     EntryKind,
     JournalEntry,
@@ -23,6 +25,7 @@ from app.ledger.ledger import (
     check_reversal,
     check_reversible,
     expense_entry,
+    foreign_expense_entry,
     reversal_of,
     total_balance,
     transfer_entry,
@@ -46,7 +49,9 @@ __all__ = [
     "EntryNotFoundError",
     "EqualSplit",
     "FixedSplit",
+    "ForeignAmount",
     "InvalidAmountError",
+    "InvalidExchangeRateError",
     "InvalidSplitError",
     "JournalEntry",
     "Ledger",
@@ -68,7 +73,9 @@ __all__ = [
     "check_postable",
     "check_reversal",
     "check_reversible",
+    "convert",
     "expense_entry",
+    "foreign_expense_entry",
     "get_currency",
     "greedy_transfers",
     "optimal_transfers",

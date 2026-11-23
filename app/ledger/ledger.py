@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 
 from app.ledger.errors import (
@@ -33,8 +34,9 @@ from app.ledger.errors import (
     UnbalancedEntryError,
     UnknownMemberError,
 )
+from app.ledger.fx import ForeignAmount
 from app.ledger.money import Currency, Money, sum_money
-from app.ledger.split import MemberId, SplitRule
+from app.ledger.split import FixedSplit, MemberId, SplitRule, allocate
 
 
 class Side(StrEnum):
@@ -76,6 +78,8 @@ class JournalEntry:
     lines: tuple[Line, ...]
     memo: str = ""
     reverses: int | None = None  # REVERSAL이면 취소하는 분개 번호
+    # 외화 지출이면 원래 금액과 환율 (5단계). 줄은 모두 기준 통화로 환산된 금액이다.
+    source: ForeignAmount | None = None
 
     def __post_init__(self) -> None:
         if len(self.lines) < 2:
@@ -95,6 +99,15 @@ class JournalEntry:
             )
         if (self.kind is EntryKind.REVERSAL) != (self.reverses is not None):
             raise UnbalancedEntryError("역분개만, 그리고 역분개는 반드시 원래 분개 번호를 가진다")
+        if self.source is not None:
+            # 증빙과 기록이 맞아야 한다: 대변 합(결제자가 낸 금액) = 원래 금액을 환산한 값
+            if self.kind is not EntryKind.EXPENSE:
+                raise UnbalancedEntryError("원래 통화 금액은 지출에만 붙는다")
+            if self.source.converted(self.currency) != self.total(Side.CREDIT):
+                raise UnbalancedEntryError(
+                    f"환산 금액 {self.source.converted(self.currency)}이 "
+                    f"기록 금액 {self.total(Side.CREDIT)}과 다르다"
+                )
 
     @property
     def currency(self) -> Currency:
@@ -129,9 +142,44 @@ def expense_entry(
     if not total.is_positive():
         raise InvalidAmountError(f"지출 금액은 양수여야 한다: {total}")
     shares = split.shares(total, rotation)
+    return JournalEntry(EntryKind.EXPENSE, _expense_lines(payer, total, shares), memo)
+
+
+def foreign_expense_entry(
+    payer: MemberId,
+    original: Money,
+    rate: Decimal,
+    base: Currency,
+    split: SplitRule,
+    memo: str = "",
+    rotation: int = 0,
+) -> JournalEntry:
+    """외화 지출: `original`을 `rate`로 `base` 통화로 한 번 환산한 뒤 `split`으로 나눈다.
+
+    정액 분할(`FixedSplit`)의 금액은 원래 통화로 받는다(영수증의 금액). 사람마다 따로 환산하면
+    반올림 때문에 합이 환산 총액과 어긋나므로, 환산 총액을 원래 금액의 비율대로 최대 나머지
+    방식으로 배분한다. 그래서 합은 언제나 환산 총액과 정확히 같다.
+    """
+    source = ForeignAmount(original, rate)
+    total = source.converted(base)
+    if not total.is_positive():
+        raise InvalidAmountError(f"환산하면 0이 되는 금액이다: {original} x {rate}")
+    if isinstance(split, FixedSplit):
+        original_shares = split.shares(original)  # 원래 통화로 합계 검사
+        weights = {m: v.minor_units for m, v in original_shares.items()}
+        shares = allocate(total, weights, rotation)
+    else:
+        shares = split.shares(total, rotation)
+    lines = _expense_lines(payer, total, shares)
+    return JournalEntry(EntryKind.EXPENSE, lines, memo, source=source)
+
+
+def _expense_lines(
+    payer: MemberId, total: Money, shares: Mapping[MemberId, Money]
+) -> tuple[Line, ...]:
     lines = [Line(payer, Side.CREDIT, total)]
     lines += [Line(m, Side.DEBIT, amount) for m, amount in shares.items() if amount.is_positive()]
-    return JournalEntry(EntryKind.EXPENSE, tuple(lines), memo)
+    return tuple(lines)
 
 
 def transfer_entry(
