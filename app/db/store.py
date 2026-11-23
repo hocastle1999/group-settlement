@@ -54,6 +54,7 @@ from app.ledger import (
     settle,
     total_balance,
 )
+from app.ledger.settle import DEFAULT_OPTIMAL_LIMIT
 
 # MySQL 오류 번호: 유니크 키 중복
 ER_DUP_ENTRY = 1062
@@ -543,14 +544,20 @@ class StoredSettlement:
     transfers: tuple[SettlementTransfer, ...]
 
 
-def plan_settlement(balances: dict[int, Money], strategy: Strategy) -> list[SettlementTransfer]:
+def plan_settlement(
+    balances: dict[int, Money], strategy: Strategy, max_members: int = DEFAULT_OPTIMAL_LIMIT
+) -> list[SettlementTransfer]:
     """잔액 -> 송금 계획. 계산은 코어(`settle`)가 하고 여기서는 id만 바꾼다."""
-    transfers = settle({member_key(m): v for m, v in balances.items()}, strategy)
+    transfers = settle({member_key(m): v for m, v in balances.items()}, strategy, max_members)
     return [SettlementTransfer(int(t.sender), int(t.receiver), t.amount) for t in transfers]
 
 
 def confirm_settlement(
-    engine: Engine, group: Group, expected_version: int, strategy: Strategy
+    engine: Engine,
+    group: Group,
+    expected_version: int,
+    strategy: Strategy,
+    max_members: int = DEFAULT_OPTIMAL_LIMIT,
 ) -> tuple[StoredSettlement, bool]:
     """원장 버전이 `expected_version`일 때만 그 시점의 송금 계획을 확정 기록한다.
 
@@ -575,7 +582,7 @@ def confirm_settlement(
         if current != expected_version:
             raise StaleVersionError(expected_version, current)
 
-        transfers = plan_settlement(group_balances(conn, group), strategy)
+        transfers = plan_settlement(group_balances(conn, group), strategy, max_members)
         settlement_id = int(
             conn.execute(
                 settlements.insert().values(

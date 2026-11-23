@@ -188,3 +188,57 @@ def test_confirm_waits_for_inflight_expense_and_then_is_stale(db):
     confirmer.join(timeout=10)
     assert isinstance(outcome[0], StaleVersionError)
     assert outcome[0].extra == {"expected_version": 1, "current_version": 2}
+
+
+# ---------------------------------------------------------------- 최적 정산 인원 한도 설정 (5단계)
+
+
+def five_people_where_greedy_is_not_optimal(client):
+    """잔액 a:-3, b:+2, c:+3, d:+2, e:-4 (천 원 단위). 최적 3번, 그리디 4번 (2단계 예시)."""
+    gid, headers, ids = setup_group(client, members=("a", "b", "c", "d", "e"))
+    for sender, receiver, amount in [("b", "a", 2), ("c", "e", 3), ("d", "e", 1), ("d", "a", 1)]:
+        body = {
+            "sender_id": ids[sender],
+            "receiver_id": ids[receiver],
+            "amount": str(amount * 1000),
+        }
+        h = {**headers, "Idempotency-Key": str(uuid.uuid4())}
+        assert client.post(f"/api/groups/{gid}/transfers", json=body, headers=h).status_code == 201
+    return gid, headers
+
+
+@pytest.fixture
+def limited_client(db, db_settings):
+    from fastapi.testclient import TestClient
+
+    from app.config import AppSettings
+    from app.main import create_app
+
+    app = create_app(db_settings, AppSettings(settle_optimal_limit=4))
+    app.state.engine = db
+    with TestClient(app) as c:
+        yield c
+
+
+def test_auto_uses_optimal_within_the_limit(client):
+    gid, headers = five_people_where_greedy_is_not_optimal(client)
+    assert len(plan(client, gid, headers)["transfers"]) == 3
+
+
+def test_limit_setting_switches_auto_to_greedy(limited_client):
+    gid, headers = five_people_where_greedy_is_not_optimal(limited_client)
+    assert len(plan(limited_client, gid, headers)["transfers"]) == 4  # 5명 > 한도 4 -> 그리디
+    res = limited_client.get(f"/api/groups/{gid}/settlement?strategy=optimal", headers=headers)
+    assert res.status_code == 422
+    assert res.json()["error"] == "TooManyMembersError"
+
+
+@pytest.mark.parametrize("value", ["0", "21", "abc"])
+def test_invalid_limit_setting_is_rejected_at_startup(monkeypatch, value):
+    from pydantic import ValidationError
+
+    from app.config import AppSettings
+
+    monkeypatch.setenv("SETTLE_OPTIMAL_LIMIT", value)
+    with pytest.raises(ValidationError):
+        AppSettings()

@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 
 from app.api import errors
 from app.api.routes import router
+from app.config import AppSettings
 from app.db.config import DatabaseSettings, create_db_engine
 
 
@@ -26,7 +27,9 @@ async def json_charset_utf8(request: Request, call_next):
     return response
 
 
-def create_app(db_settings: DatabaseSettings | None = None) -> FastAPI:
+def create_app(
+    db_settings: DatabaseSettings | None = None, settings: AppSettings | None = None
+) -> FastAPI:
     """설정을 받아 새 앱을 만든다. 테스트는 테스트 DB 설정으로 앱을 따로 만든다."""
     engine = create_db_engine(db_settings or DatabaseSettings())
 
@@ -38,6 +41,7 @@ def create_app(db_settings: DatabaseSettings | None = None) -> FastAPI:
     app = FastAPI(title="group-settlement", lifespan=lifespan)
     app.middleware("http")(json_charset_utf8)
     app.state.engine = engine
+    app.state.settings = settings or AppSettings()
     app.include_router(router)
     errors.install(app)
 

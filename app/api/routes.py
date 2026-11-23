@@ -15,7 +15,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, 
 from pydantic import BaseModel
 
 from app.api import schemas as s
-from app.api.auth import CurrentGroup, EngineDep, hash_token, new_invite_token
+from app.api.auth import CurrentGroup, EngineDep, SettingsDep, hash_token, new_invite_token
 from app.db import store
 from app.db.store import Group, PostResult, StoredEntry, member_key
 from app.ledger import (
@@ -207,6 +207,7 @@ def get_balances(group: CurrentGroup, engine: EngineDep) -> s.BalancesOut:
 def get_settlement(
     group: CurrentGroup,
     engine: EngineDep,
+    settings: SettingsDep,
     strategy: Strategy = Strategy.AUTO,
 ) -> s.SettlementOut:
     """지금 잔액을 0으로 만드는 송금 목록. 계산만 하고 기록하지 않는다 (확정은 POST /settlements).
@@ -218,7 +219,9 @@ def get_settlement(
         currency=group.currency.code,
         strategy=strategy,
         version=snap.version,
-        transfers=_transfers_out(store.plan_settlement(snap.balances, strategy)),
+        transfers=_transfers_out(
+            store.plan_settlement(snap.balances, strategy, settings.settle_optimal_limit)
+        ),
     )
 
 
@@ -231,7 +234,11 @@ def get_settlement(
     response_model=s.ConfirmedSettlementOut,
 )
 def confirm_settlement(
-    body: s.SettlementConfirm, group: CurrentGroup, engine: EngineDep, response: Response
+    body: s.SettlementConfirm,
+    group: CurrentGroup,
+    engine: EngineDep,
+    settings: SettingsDep,
+    response: Response,
 ) -> s.ConfirmedSettlementOut:
     """GET /settlement에서 받은 version으로 확정한다. 그사이 분개가 더 기록됐으면 409.
 
@@ -239,7 +246,7 @@ def confirm_settlement(
     처음 확정을 200으로 돌려준다(자연 키).
     """
     settlement, created = store.confirm_settlement(
-        engine, group, body.expected_version, body.strategy
+        engine, group, body.expected_version, body.strategy, settings.settle_optimal_limit
     )
     if not created:
         response.status_code = status.HTTP_200_OK

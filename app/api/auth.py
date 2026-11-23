@@ -21,6 +21,7 @@ from typing import Annotated
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import Engine
 
+from app.config import AppSettings
 from app.db import store
 from app.db.store import Group
 
@@ -37,6 +38,10 @@ def hash_token(token: str) -> bytes:
 
 def get_engine(request: Request) -> Engine:
     return request.app.state.engine
+
+
+def get_settings(request: Request) -> AppSettings:
+    return request.app.state.settings
 
 
 def _bearer_token(authorization: str | None) -> str:
@@ -69,3 +74,4 @@ def current_group(
 
 CurrentGroup = Annotated[Group, Depends(current_group)]
 EngineDep = Annotated[Engine, Depends(get_engine)]
+SettingsDep = Annotated[AppSettings, Depends(get_settings)]
