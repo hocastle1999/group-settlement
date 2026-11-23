@@ -383,6 +383,8 @@ def test_app_never_updates_or_deletes_ledger_rows(client, db):
 
     assert any(s.startswith("INSERT INTO JOURNAL_ENTRIES") for s in statements)
     writes = [s for s in statements if s.startswith(("UPDATE", "DELETE"))]
-    # 원장 버전(그룹 행의 last_seq)만 늘린다. 분개, 줄, 멱등성 키는 INSERT만 한다.
+    # 그룹 행의 카운터(원장 버전 last_seq, 감사 로그 기준점 audit_seq/audit_head)만 고친다.
+    # 분개, 줄, 멱등성 키, 감사 로그는 INSERT만 한다.
     assert writes
-    assert all(s.startswith("UPDATE SETTLEMENT_GROUPS SET LAST_SEQ") for s in writes), writes
+    assert all(s.startswith("UPDATE SETTLEMENT_GROUPS SET") for s in writes), writes
+    assert any(s.startswith("INSERT INTO AUDIT_EVENTS") for s in statements)

@@ -24,6 +24,7 @@ from sqlalchemy import Engine
 from app.config import AppSettings
 from app.db import store
 from app.db.store import Group
+from app.ledger import UnknownMemberError
 
 TOKEN_BYTES = 32
 
@@ -73,5 +74,25 @@ def current_group(
 
 
 CurrentGroup = Annotated[Group, Depends(current_group)]
+
+
+def current_actor(
+    group: CurrentGroup,
+    engine: Annotated[Engine, Depends(get_engine)],
+    x_actor_member_id: Annotated[int | None, Header()] = None,
+) -> int | None:
+    """감사 로그에 남길 "누가". 요청 헤더 X-Actor-Member-Id (선택).
+
+    인증이 아니다. 같은 초대 토큰을 가진 사람은 누구든 다른 멤버라고 말할 수 있다.
+    그 멤버가 이 그룹에 있는지만 확인한다. 사람별 권한은 멤버별 토큰이나 계정이 있어야 한다.
+    """
+    if x_actor_member_id is None:
+        return None
+    if x_actor_member_id not in {m.id for m in store.get_members(engine, group.id)}:
+        raise UnknownMemberError(f"그룹에 없는 멤버: X-Actor-Member-Id={x_actor_member_id}")
+    return x_actor_member_id
+
+
+ActorDep = Annotated[int | None, Depends(current_actor)]
 EngineDep = Annotated[Engine, Depends(get_engine)]
 SettingsDep = Annotated[AppSettings, Depends(get_settings)]

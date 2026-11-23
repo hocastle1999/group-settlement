@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -198,6 +198,28 @@ class ConfirmedSettlementOut(BaseModel):
     transfers: list[ConfirmedTransferOut]
     # 모든 송금 줄이 완료됐는지 (송금이 하나도 없는 정산은 처음부터 완료)
     completed: bool
+
+
+class AuditEventOut(BaseModel):
+    seq: int
+    action: str
+    target_id: int | None
+    actor_member_id: int | None  # 요청자가 밝힌 멤버 (인증 아님)
+    detail: dict[str, Any]
+    created_at: datetime
+    hash: str  # 16진수. 직전 행 hash + 이 행 내용의 SHA-256
+
+
+class AuditPage(BaseModel):
+    events: list[AuditEventOut]
+    next_before_seq: int | None
+
+
+class AuditVerifyOut(BaseModel):
+    valid: bool
+    events: int
+    broken_at_seq: int | None
+    reason: str | None
 
 
 class ConfirmedSettlementList(BaseModel):

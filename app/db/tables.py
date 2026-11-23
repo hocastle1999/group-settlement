@@ -11,6 +11,7 @@ ORM 대신 Core를 쓰는 이유: 원장은 한 번 쓰고 고치지 않는 기�
 
 from sqlalchemy import (
     BINARY,
+    JSON,
     BigInteger,
     CheckConstraint,
     Column,
@@ -25,6 +26,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.mysql import DATETIME
 
 from app.ledger import CURRENCIES, EntryKind, Side, Strategy
 
@@ -70,6 +72,9 @@ settlement_groups = Table(
     # 이 그룹의 마지막 분개 순번 = 원장 버전. 분개를 쓰는 트랜잭션은 이 행을 FOR UPDATE로 잠그고
     # 1 늘린다. 그래서 같은 그룹의 쓰기는 한 줄로 서고, 순번 순서가 곧 커밋 순서가 된다 (store.py).
     Column("last_seq", BigInteger, nullable=False, server_default="0"),
+    # 감사 로그(6단계)의 마지막 순번과 마지막 행의 해시. 끝부분이 잘려 나가도 드러나게 하는 기준점.
+    Column("audit_seq", BigInteger, nullable=False, server_default="0"),
+    Column("audit_head", BINARY(32), nullable=True),
     Column("created_at", DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")),
     UniqueConstraint("invite_token_hash"),
     CheckConstraint(_in("currency", CURRENCY_CODES), name="currency"),
@@ -235,4 +240,37 @@ settlement_transfers = Table(
     Index(None, "group_id", "receiver_member_id"),
     CheckConstraint("amount > 0", name="amount_positive"),
     CheckConstraint("sender_member_id <> receiver_member_id", name="different_members"),
+)
+
+# 감사 로그 (6단계). 누가(스스로 밝힌 멤버), 언제, 무엇을 했는지 한 줄씩. 추가만 한다.
+# 바뀌는 내용과 같은 트랜잭션에 기록하고, 행마다 직전 행 해시를 이어 붙인 해시를 남긴다.
+AUDIT_ACTIONS = [
+    "GROUP_CREATED",
+    "MEMBER_ADDED",
+    "EXPENSE_RECORDED",
+    "TRANSFER_RECORDED",
+    "ENTRY_REVERSED",
+    "SETTLEMENT_CONFIRMED",
+    "TRANSFER_COMPLETED",
+]
+
+audit_events = Table(
+    "audit_events",
+    metadata,
+    Column("group_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("seq", BigInteger, primary_key=True, autoincrement=False),  # 그룹 안 순번
+    Column("action", String(32), nullable=False),
+    Column("target_id", BigInteger, nullable=True),  # 분개, 멤버, 정산 id
+    # 요청 헤더 X-Actor-Member-Id로 "누가 했다고 밝혔는지". 인증이 아니다 (docs/design.md 6단계).
+    Column("actor_member_id", BigInteger, nullable=True),
+    Column("detail", JSON, nullable=False),
+    # 해시에 들어가는 값이라 앱이 정해 넣는다 (마이크로초까지, UTC).
+    Column("created_at", DATETIME(fsp=6), nullable=False),
+    Column("prev_hash", BINARY(32), nullable=False),
+    Column("hash", BINARY(32), nullable=False),
+    ForeignKeyConstraint(["group_id"], ["settlement_groups.id"]),
+    ForeignKeyConstraint(["group_id", "actor_member_id"], ["members.group_id", "members.id"]),
+    Index(None, "group_id", "actor_member_id"),
+    CheckConstraint(_in("action", AUDIT_ACTIONS), name="action"),
+    CheckConstraint("seq > 0", name="seq_positive"),
 )

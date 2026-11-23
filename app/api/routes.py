@@ -15,8 +15,15 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, 
 from pydantic import BaseModel
 
 from app.api import schemas as s
-from app.api.auth import CurrentGroup, EngineDep, SettingsDep, hash_token, new_invite_token
-from app.db import store
+from app.api.auth import (
+    ActorDep,
+    CurrentGroup,
+    EngineDep,
+    SettingsDep,
+    hash_token,
+    new_invite_token,
+)
+from app.db import audit, store
 from app.db.store import Group, PostResult, StoredEntry, member_key
 from app.ledger import (
     Currency,
@@ -69,9 +76,11 @@ def get_group(group: CurrentGroup, engine: EngineDep) -> s.GroupOut:
     status_code=status.HTTP_201_CREATED,
     response_model=s.MemberOut,
 )
-def add_member(body: s.MemberCreate, group: CurrentGroup, engine: EngineDep) -> s.MemberOut:
+def add_member(
+    body: s.MemberCreate, group: CurrentGroup, engine: EngineDep, actor: ActorDep = None
+) -> s.MemberOut:
     # 멱등성 키 대신 자연 키(그룹 안에서 이름이 유일)로 중복을 막는다. 재시도하면 409.
-    member = store.add_member(engine, group.id, body.name)
+    member = store.add_member(engine, group.id, body.name, actor)
     return s.MemberOut(id=member.id, name=member.name)
 
 
@@ -93,6 +102,7 @@ def record_expense(
     request: Request,
     response: Response,
     idempotency_key: IdempotencyKeyHeader = None,
+    actor: ActorDep = None,
 ) -> s.EntryOut:
     key = _require_key(idempotency_key)
     # 금액, 환율, 분할 규칙은 그룹 잠금을 잡기 전에 만들어 검사한다(잘못된 요청이 잠금을 잡지 않게).
@@ -122,7 +132,9 @@ def record_expense(
                 payer, amount, rate, group.currency, split, body.memo, rotation=seq
             )
 
-    result = store.post_entry(engine, group, build, key, _request_hash(request, body))
+    result = store.post_entry(
+        engine, group, build, key, _request_hash(request, body), actor_id=actor
+    )
     return _entry_response(result, response)
 
 
@@ -138,6 +150,7 @@ def record_transfer(
     request: Request,
     response: Response,
     idempotency_key: IdempotencyKeyHeader = None,
+    actor: ActorDep = None,
 ) -> s.EntryOut:
     key = _require_key(idempotency_key)
 
@@ -149,7 +162,9 @@ def record_transfer(
             body.memo,
         )
 
-    result = store.post_entry(engine, group, build, key, _request_hash(request, body))
+    result = store.post_entry(
+        engine, group, build, key, _request_hash(request, body), actor_id=actor
+    )
     return _entry_response(result, response)
 
 
@@ -166,11 +181,14 @@ def reverse_entry(
     response: Response,
     body: s.ReversalCreate | None = None,
     idempotency_key: IdempotencyKeyHeader = None,
+    actor: ActorDep = None,
 ) -> s.EntryOut:
     key = _require_key(idempotency_key)
     body = body or s.ReversalCreate()
     build = store.reversal_builder(group, entry_id, body.memo)
-    result = store.post_entry(engine, group, build, key, _request_hash(request, body))
+    result = store.post_entry(
+        engine, group, build, key, _request_hash(request, body), actor_id=actor
+    )
     return _entry_response(result, response)
 
 
@@ -188,6 +206,7 @@ def complete_transfer(
     response: Response,
     body: s.CompletionCreate | None = None,
     idempotency_key: IdempotencyKeyHeader = None,
+    actor: ActorDep = None,
 ) -> s.EntryOut:
     """확정 정산의 송금 한 줄을 "보냈다"로 기록한다 = 그 금액의 송금 분개를 남긴다.
 
@@ -197,7 +216,13 @@ def complete_transfer(
     body = body or s.CompletionCreate()
     build = store.completion_builder(group, settlement_id, line_no, body.memo)
     result = store.post_entry(
-        engine, group, build, key, _request_hash(request, body), link=(settlement_id, line_no)
+        engine,
+        group,
+        build,
+        key,
+        _request_hash(request, body),
+        link=(settlement_id, line_no),
+        actor_id=actor,
     )
     return _entry_response(result, response)
 
@@ -267,6 +292,7 @@ def confirm_settlement(
     engine: EngineDep,
     settings: SettingsDep,
     response: Response,
+    actor: ActorDep = None,
 ) -> s.ConfirmedSettlementOut:
     """GET /settlement에서 받은 version으로 확정한다. 그사이 분개가 더 기록됐으면 409.
 
@@ -274,7 +300,7 @@ def confirm_settlement(
     처음 확정을 200으로 돌려준다(자연 키).
     """
     settlement, created = store.confirm_settlement(
-        engine, group, body.expected_version, body.strategy, settings.settle_optimal_limit
+        engine, group, body.expected_version, body.strategy, settings.settle_optimal_limit, actor
     )
     if not created:
         response.status_code = status.HTTP_200_OK
@@ -301,6 +327,46 @@ def get_confirmed_settlement(
 ) -> s.ConfirmedSettlementOut:
     settlement = store.get_settlement(engine, group, settlement_id)
     return _confirmed_out(group, settlement, store.current_version(engine, group))
+
+
+# ---------------------------------------------------------------- 감사 로그
+
+
+@router.get("/groups/{group_id}/audit", response_model=s.AuditPage)
+def list_audit(
+    group: CurrentGroup,
+    engine: EngineDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    before_seq: Annotated[int | None, Query(ge=1)] = None,
+) -> s.AuditPage:
+    events = audit.list_events(engine, group.id, limit, before_seq)
+    return s.AuditPage(
+        events=[
+            s.AuditEventOut(
+                seq=e.seq,
+                action=e.action,
+                target_id=e.target_id,
+                actor_member_id=e.actor_member_id,
+                detail=e.detail,
+                created_at=e.created_at,
+                hash=e.hash.hex(),
+            )
+            for e in events
+        ],
+        next_before_seq=events[-1].seq if len(events) == limit else None,
+    )
+
+
+@router.get("/groups/{group_id}/audit/verify", response_model=s.AuditVerifyOut)
+def verify_audit(group: CurrentGroup, engine: EngineDep) -> s.AuditVerifyOut:
+    """해시 체인을 처음부터 다시 계산해 고쳐지거나 지워진 행이 있는지 본다."""
+    result = audit.verify(engine, group.id)
+    return s.AuditVerifyOut(
+        valid=result.valid,
+        events=result.events,
+        broken_at_seq=result.broken_at_seq,
+        reason=result.reason,
+    )
 
 
 # ---------------------------------------------------------------- 도우미

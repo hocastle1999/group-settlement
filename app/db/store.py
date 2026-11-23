@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from sqlalchemy import Connection, Engine, case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from app.db import audit
 from app.db.tables import (
     entry_lines,
     idempotency_keys,
@@ -52,6 +53,7 @@ from app.ledger import (
     get_currency,
     reversal_of,
     settle,
+    sum_money,
     total_balance,
     transfer_entry,
 )
@@ -138,7 +140,16 @@ def create_group(engine: Engine, name: str, currency: Currency, token_hash: byte
                 name=name, currency=currency.code, invite_token_hash=token_hash
             )
         )
-        return Group(int(result.inserted_primary_key[0]), name, currency)
+        group_id = int(result.inserted_primary_key[0])
+        audit.append(
+            conn,
+            group_id,
+            "GROUP_CREATED",
+            group_id,
+            None,
+            {"name": name, "currency": currency.code},
+        )
+        return Group(group_id, name, currency)
 
 
 def find_group(engine: Engine, group_id: int, token_hash: bytes) -> Group | None:
@@ -155,11 +166,14 @@ def find_group(engine: Engine, group_id: int, token_hash: bytes) -> Group | None
     return Group(group_id, row.name, get_currency(row.currency))
 
 
-def add_member(engine: Engine, group_id: int, name: str) -> Member:
+def add_member(engine: Engine, group_id: int, name: str, actor_id: int | None = None) -> Member:
     try:
         with engine.begin() as conn:
+            lock_group(conn, group_id)  # 감사 로그 순서를 위해 같은 그룹의 쓰기와 한 줄로 선다
             result = conn.execute(members.insert().values(group_id=group_id, name=name))
-            return Member(int(result.inserted_primary_key[0]), name)
+            member = Member(int(result.inserted_primary_key[0]), name)
+            audit.append(conn, group_id, "MEMBER_ADDED", member.id, actor_id, {"name": name})
+            return member
     except IntegrityError as exc:
         # 이름 중복 검사를 SELECT로 먼저 하면 두 요청이 동시에 통과할 수 있다.
         # 유니크 제약에 맡기고 위반을 번역하는 쪽이 경쟁 상황에서도 정확하다.
@@ -198,6 +212,7 @@ def post_entry(
     idempotency_key: str,
     request_hash: bytes,
     link: tuple[int, int] | None = None,
+    actor_id: int | None = None,
 ) -> PostResult:
     """분개 하나를 검사하고 기록한다. 같은 멱등성 키로 다시 오면 처음 결과를 돌려준다.
 
@@ -242,6 +257,7 @@ def post_entry(
                     raise _KeyAlreadyUsed from None
                 raise
             stored = _load_entries(conn, group.id, [entry_id])[0]
+            _audit_entry(conn, group, stored, actor_id)
     except _KeyAlreadyUsed:
         # 위 트랜잭션은 롤백됐다(분개도 없음). 먼저 커밋된 요청의 결과를 새 연결로 읽는다.
         with engine.connect() as conn:
@@ -249,6 +265,36 @@ def post_entry(
         assert replay is not None
         return replay
     return PostResult(stored, replayed=False)
+
+
+def _audit_entry(conn: Connection, group: Group, entry: StoredEntry, actor_id: int | None) -> None:
+    if entry.settlement_link is not None:
+        action = "TRANSFER_COMPLETED"
+    else:
+        action = {
+            EntryKind.EXPENSE: "EXPENSE_RECORDED",
+            EntryKind.TRANSFER: "TRANSFER_RECORDED",
+            EntryKind.REVERSAL: "ENTRY_REVERSED",
+        }[entry.kind]
+    credit = sum_money([ln.amount for ln in entry.lines if ln.side is Side.CREDIT], group.currency)
+    detail: dict[str, object] = {
+        "entry_seq": entry.seq,
+        "kind": entry.kind.value,
+        "amount": str(credit.amount),
+        "currency": group.currency.code,
+        "memo": entry.memo,
+    }
+    if entry.reverses_entry_id is not None:
+        detail["reverses_entry_id"] = entry.reverses_entry_id
+    if entry.original is not None:
+        detail["original"] = {
+            "currency": entry.original.amount.currency.code,
+            "amount": str(entry.original.amount.amount),
+            "fx_rate": str(entry.original.rate.normalize()),
+        }
+    if entry.settlement_link is not None:
+        detail["settlement_id"], detail["line_no"] = entry.settlement_link
+    audit.append(conn, group.id, action, entry.id, actor_id, detail)
 
 
 def lock_group(conn: Connection, group_id: int) -> int:
@@ -580,6 +626,7 @@ def confirm_settlement(
     expected_version: int,
     strategy: Strategy,
     max_members: int = DEFAULT_OPTIMAL_LIMIT,
+    actor_id: int | None = None,
 ) -> tuple[StoredSettlement, bool]:
     """원장 버전이 `expected_version`일 때만 그 시점의 송금 계획을 확정 기록한다.
 
@@ -627,6 +674,14 @@ def confirm_settlement(
                     for no, t in enumerate(transfers, start=1)
                 ],
             )
+        audit.append(
+            conn,
+            group.id,
+            "SETTLEMENT_CONFIRMED",
+            settlement_id,
+            actor_id,
+            {"version": current, "strategy": strategy.value, "transfers": len(transfers)},
+        )
         return _load_settlement(conn, group, settlement_id), True
 
 
