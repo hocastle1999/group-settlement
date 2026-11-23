@@ -16,6 +16,8 @@ from app.ledger import CURRENCIES, EntryKind, Side, Strategy
 
 # 부호 없는 십진수 문자열. 소수 자릿수(통화 단위) 검사는 Money가 한다 (1.5원 -> 422).
 AmountStr = Annotated[str, StringConstraints(pattern=r"^\d{1,15}(\.\d{1,4})?$")]
+# 환율: 원래 통화 1단위당 기준 통화 단위. 정수 10자리, 소수 10자리까지 (그 이상은 자르지 않고 거부).
+RateStr = Annotated[str, StringConstraints(pattern=r"^\d{1,10}(\.\d{1,10})?$")]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 Memo = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
 CurrencyCode = Literal[tuple(sorted(CURRENCIES))]  # type: ignore[valid-type]
@@ -88,9 +90,12 @@ SplitIn = Annotated[EqualSplitIn | RatioSplitIn | FixedSplitIn, Field(discrimina
 
 class ExpenseCreate(Request):
     payer_id: int
-    amount: AmountStr
+    amount: AmountStr  # currency 통화의 금액. 정액 분할 금액도 같은 통화
     split: SplitIn
     memo: Memo = ""
+    # 지출 통화. 없으면 그룹 기준 통화. 다르면 fx_rate가 필요하고, 같으면 fx_rate를 보내지 않는다.
+    currency: CurrencyCode | None = None  # type: ignore[valid-type]
+    fx_rate: RateStr | None = None
 
 
 class TransferCreate(Request):
@@ -113,6 +118,14 @@ class LineOut(BaseModel):
     amount: str
 
 
+class OriginalOut(BaseModel):
+    """외화 지출의 원래 금액과 환율. 줄(lines)은 그룹 기준 통화로 환산된 금액이다."""
+
+    currency: str
+    amount: str
+    fx_rate: str
+
+
 class EntryOut(BaseModel):
     id: int
     seq: int  # 그룹 안 순번 (1, 2, 3, ...)
@@ -120,6 +133,7 @@ class EntryOut(BaseModel):
     memo: str
     reverses_entry_id: int | None
     reversed_by_entry_id: int | None
+    original: OriginalOut | None
     created_at: datetime
     lines: list[LineOut]
 

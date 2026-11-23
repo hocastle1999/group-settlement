@@ -25,6 +25,7 @@ from app.ledger import (
     CurrencyMismatchError,
     EntryNotFoundError,
     InvalidAmountError,
+    InvalidExchangeRateError,
     InvalidSplitError,
     LedgerError,
     TooManyMembersError,
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 STATUS_BY_ERROR: list[tuple[type[Exception], int]] = [
     # 요청 내용이 원장 규칙에 어긋난다 (형식은 맞지만 처리할 수 없는 내용)
     (InvalidAmountError, status.HTTP_422_UNPROCESSABLE_CONTENT),
+    (InvalidExchangeRateError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     (InvalidSplitError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     (UnbalancedEntryError, status.HTTP_422_UNPROCESSABLE_CONTENT),
     (CurrencyMismatchError, status.HTTP_422_UNPROCESSABLE_CONTENT),

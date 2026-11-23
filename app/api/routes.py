@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
@@ -18,14 +19,18 @@ from app.api.auth import CurrentGroup, EngineDep, hash_token, new_invite_token
 from app.db import store
 from app.db.store import Group, PostResult, StoredEntry, member_key
 from app.ledger import (
+    Currency,
     EqualSplit,
     FixedSplit,
+    InvalidExchangeRateError,
     InvalidSplitError,
     Money,
     RatioSplit,
     SplitRule,
     Strategy,
+    convert,
     expense_entry,
+    foreign_expense_entry,
     get_currency,
     transfer_entry,
 )
@@ -90,13 +95,32 @@ def record_expense(
     idempotency_key: IdempotencyKeyHeader = None,
 ) -> s.EntryOut:
     key = _require_key(idempotency_key)
-    currency = group.currency
+    # 금액, 환율, 분할 규칙은 그룹 잠금을 잡기 전에 만들어 검사한다(잘못된 요청이 잠금을 잡지 않게).
+    # 잠금 안에서는 순번(seq)이 필요한 일만 한다: 남는 단위를 받을 출발점을 순번만큼 돌린다.
+    currency = get_currency(body.currency) if body.currency else group.currency
+    amount = Money.of(body.amount, currency)
+    split = _split_rule(body.split, currency)
+    payer = member_key(body.payer_id)
 
-    def build(_conn, seq: int):
-        total = Money.of(body.amount, currency)
-        split = _split_rule(body.split, group)
-        # 남는 단위를 받을 출발점을 분개 순번만큼 돌린다 (한 사람에게 몰리지 않게)
-        return expense_entry(member_key(body.payer_id), total, split, body.memo, rotation=seq)
+    if currency == group.currency:
+        if body.fx_rate is not None:
+            raise InvalidExchangeRateError("그룹 기준 통화 지출에는 fx_rate를 보내지 않는다")
+
+        def build(_conn, seq: int):
+            return expense_entry(payer, amount, split, body.memo, rotation=seq)
+    else:
+        if body.fx_rate is None:
+            raise InvalidExchangeRateError(
+                f"{currency.code} 지출은 fx_rate(1 {currency.code}당 {group.currency.code})"
+                "가 필요하다"
+            )
+        rate = Decimal(body.fx_rate)
+        convert(amount, rate, group.currency)  # 환율 범위, 환산 금액 크기를 잠금 전에 검사
+
+        def build(_conn, seq: int):
+            return foreign_expense_entry(
+                payer, amount, rate, group.currency, split, body.memo, rotation=seq
+            )
 
     result = store.post_entry(engine, group, build, key, _request_hash(request, body))
     return _entry_response(result, response)
@@ -300,8 +324,13 @@ def _request_hash(request: Request, body: BaseModel) -> bytes:
     return store.hash_bytes(f"{request.method} {request.url.path}\n{canonical}".encode())
 
 
-def _split_rule(split: s.EqualSplitIn | s.RatioSplitIn | s.FixedSplitIn, group: Group) -> SplitRule:
-    """요청의 분할을 코어 SplitRule로. 검증(중복, 합계, 가중치)은 코어가 한다."""
+def _split_rule(
+    split: s.EqualSplitIn | s.RatioSplitIn | s.FixedSplitIn, currency: Currency
+) -> SplitRule:
+    """요청의 분할을 코어 SplitRule로. 검증(중복, 합계, 가중치)은 코어가 한다.
+
+    정액 분할 금액은 지출 통화(`currency`)다. 외화 지출이면 코어가 환산 총액을 그 비율로 나눈다.
+    """
     if isinstance(split, s.EqualSplitIn):
         return EqualSplit([member_key(m) for m in split.member_ids])
     if isinstance(split, s.RatioSplitIn):
@@ -311,7 +340,7 @@ def _split_rule(split: s.EqualSplitIn | s.RatioSplitIn | s.FixedSplitIn, group: 
     ids = [a.member_id for a in split.amounts]
     _no_duplicates(ids)
     return FixedSplit(
-        {member_key(a.member_id): Money.of(a.amount, group.currency) for a in split.amounts}
+        {member_key(a.member_id): Money.of(a.amount, currency) for a in split.amounts}
     )
 
 
@@ -336,6 +365,15 @@ def _entry_out(entry: StoredEntry) -> s.EntryOut:
         memo=entry.memo,
         reverses_entry_id=entry.reverses_entry_id,
         reversed_by_entry_id=entry.reversed_by_entry_id,
+        original=(
+            None
+            if entry.original is None
+            else s.OriginalOut(
+                currency=entry.original.amount.currency.code,
+                amount=str(entry.original.amount.amount),
+                fx_rate=str(entry.original.rate.normalize()),
+            )
+        ),
         created_at=entry.created_at,
         lines=[
             s.LineOut(member_id=ln.member_id, side=ln.side, amount=str(ln.amount.amount))

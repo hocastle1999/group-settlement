@@ -39,6 +39,7 @@ from app.ledger import (
     Currency,
     EntryKind,
     EntryNotFoundError,
+    ForeignAmount,
     JournalEntry,
     Line,
     Money,
@@ -104,6 +105,7 @@ class StoredEntry:
     memo: str
     reverses_entry_id: int | None
     reversed_by_entry_id: int | None  # 이 분개를 취소한 역분개 id
+    original: ForeignAmount | None  # 외화 지출이면 원래 금액과 환율 (줄은 기준 통화)
     created_at: datetime
     lines: tuple[StoredLine, ...]
 
@@ -299,6 +301,9 @@ def _insert_checked(conn: Connection, group: Group, entry: JournalEntry, seq: in
                 kind=entry.kind.value,
                 memo=entry.memo,
                 reverses_entry_id=entry.reverses,
+                original_currency=entry.source.amount.currency.code if entry.source else None,
+                original_amount=entry.source.amount.amount if entry.source else None,
+                fx_rate=entry.source.rate if entry.source else None,
             )
         )
     except IntegrityError as exc:
@@ -352,6 +357,7 @@ def load_posted(conn: Connection, group: Group, entry_id: int) -> PostedEntry:
         tuple(Line(member_key(ln.member_id), ln.side, ln.amount) for ln in stored.lines),
         stored.memo,
         reverses=stored.reverses_entry_id,
+        source=stored.original,
     )
     return PostedEntry(stored.id, entry)
 
@@ -392,6 +398,9 @@ def _load_entries(conn: Connection, group_id: int, ids: Sequence[int]) -> list[S
             journal_entries.c.kind,
             journal_entries.c.memo,
             journal_entries.c.reverses_entry_id,
+            journal_entries.c.original_currency,
+            journal_entries.c.original_amount,
+            journal_entries.c.fx_rate,
             journal_entries.c.created_at,
             reverser.c.id.label("reversed_by"),
         )
@@ -418,6 +427,13 @@ def _load_entries(conn: Connection, group_id: int, ids: Sequence[int]) -> list[S
             kind=EntryKind(h.kind),
             memo=h.memo,
             reverses_entry_id=h.reverses_entry_id,
+            original=(
+                None
+                if h.original_currency is None
+                else ForeignAmount(
+                    Money(h.original_amount, get_currency(h.original_currency)), h.fx_rate
+                )
+            ),
             reversed_by_entry_id=h.reversed_by,
             created_at=h.created_at.replace(tzinfo=UTC),  # DB에는 UTC로 저장된다 (연결 시간대)
             lines=tuple(lines.get(h.id, ())),
