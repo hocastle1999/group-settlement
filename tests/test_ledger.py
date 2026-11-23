@@ -14,12 +14,16 @@ from app.ledger import (
     Ledger,
     Line,
     Money,
+    PostedEntry,
     RatioSplit,
     Side,
     UnbalancedEntryError,
     UnknownMemberError,
+    check_postable,
+    check_reversal,
     expense_entry,
     get_currency,
+    reversal_of,
     total_balance,
     transfer_entry,
 )
@@ -98,6 +102,24 @@ def test_forged_reversal_rejected(ledger):
         ledger.post(fake)
     assert not ledger.is_reversed(posted.entry_id)
     assert len(ledger.entries) == 1
+
+
+def test_check_functions_work_without_a_ledger():
+    """DB 저장 계층은 메모리 원장 없이 같은 검사 함수를 쓴다. 분개 번호는 DB id(연속 아님)."""
+    entry = transfer_entry("a", "b", krw(1_000))
+    check_postable(entry, KRW, ["a", "b"])
+    with pytest.raises(UnknownMemberError):
+        check_postable(entry, KRW, ["a"])
+    with pytest.raises(CurrencyMismatchError):
+        check_postable(entry, get_currency("USD"), ["a", "b"])
+
+    target = PostedEntry(42, entry)
+    check_reversal(reversal_of(target), target, already_reversed=False)
+    with pytest.raises(AlreadyReversedError):
+        check_reversal(reversal_of(target), target, already_reversed=True)
+    # 다른 분개를 가리키는 역분개는 줄이 같아도 거부
+    with pytest.raises(UnbalancedEntryError):
+        check_reversal(reversal_of(PostedEntry(7, entry)), target, already_reversed=False)
 
 
 def test_unbalanced_entry_cannot_be_created():

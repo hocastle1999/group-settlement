@@ -154,6 +154,39 @@ def reversal_of(posted: PostedEntry, memo: str = "") -> JournalEntry:
     return JournalEntry(EntryKind.REVERSAL, lines, memo, reverses=posted.entry_id)
 
 
+# --- 기록 전 검사 ---
+# 메모리 원장(`Ledger`)과 DB 저장 계층(`app.db.store`)이 같은 함수를 쓴다.
+# 규칙을 한 곳에만 두어, 한쪽만 고쳐서 두 구현이 어긋나는 일을 막는다.
+
+
+def check_postable(entry: JournalEntry, currency: Currency, members: Iterable[MemberId]) -> None:
+    """분개를 이 원장(통화 `currency`, 멤버 `members`)에 기록할 수 있는지 검사한다."""
+    if entry.currency != currency:
+        raise CurrencyMismatchError(
+            f"원장 통화는 {currency.code}인데 분개는 {entry.currency.code}다"
+        )
+    unknown = entry.members() - frozenset(members)
+    if unknown:
+        raise UnknownMemberError(f"원장에 없는 멤버: {sorted(unknown)}")
+
+
+def check_reversible(target: PostedEntry, already_reversed: bool) -> None:
+    """`target`을 취소할 수 있는지 검사한다. `already_reversed`는 이미 역분개가 있는지."""
+    if target.entry.kind is EntryKind.REVERSAL:
+        # 취소의 취소는 허용하지 않는다. 다시 필요하면 원래 거래를 새로 기록한다.
+        # (취소와 재취소가 얽힌 이력보다 읽기 쉽다)
+        raise AlreadyReversedError(f"역분개 {target.entry_id}는 취소할 수 없다")
+    if already_reversed:
+        raise AlreadyReversedError(f"분개 {target.entry_id}는 이미 취소됐다")
+
+
+def check_reversal(entry: JournalEntry, target: PostedEntry, already_reversed: bool) -> None:
+    """역분개 `entry`가 `target`을 정확히 뒤집은 것이고 취소가 허용되는지 검사한다."""
+    check_reversible(target, already_reversed)
+    if entry.reverses != target.entry_id or entry.lines != reversal_of(target).lines:
+        raise UnbalancedEntryError("역분개의 줄이 원래 분개를 정확히 뒤집은 것이 아니다")
+
+
 # --- 원장 ---
 
 
@@ -186,18 +219,10 @@ class Ledger:
 
     def post(self, entry: JournalEntry) -> PostedEntry:
         """분개를 검사하고 원장 끝에 추가한다. 실패하면 원장은 바뀌지 않는다."""
-        if entry.currency != self.currency:
-            raise CurrencyMismatchError(
-                f"원장 통화는 {self.currency.code}인데 분개는 {entry.currency.code}다"
-            )
-        unknown = entry.members() - self._members
-        if unknown:
-            raise UnknownMemberError(f"원장에 없는 멤버: {sorted(unknown)}")
+        check_postable(entry, self.currency, self._members)
         if entry.kind is EntryKind.REVERSAL:
             target = self.get(entry.reverses)  # type: ignore[arg-type]
-            self._check_reversible(target)
-            if entry.lines != reversal_of(target).lines:
-                raise UnbalancedEntryError("역분개의 줄이 원래 분개를 정확히 뒤집은 것이 아니다")
+            check_reversal(entry, target, self.is_reversed(target.entry_id))
             self._reversed.add(target.entry_id)
 
         posted = PostedEntry(len(self._entries) + 1, entry)
@@ -207,16 +232,8 @@ class Ledger:
     def reverse(self, entry_id: int, memo: str = "") -> PostedEntry:
         """분개 `entry_id`를 취소하는 역분개를 기록한다."""
         target = self.get(entry_id)
-        self._check_reversible(target)
+        check_reversible(target, self.is_reversed(entry_id))
         return self.post(reversal_of(target, memo))
-
-    def _check_reversible(self, target: PostedEntry) -> None:
-        if target.entry.kind is EntryKind.REVERSAL:
-            # 취소의 취소는 허용하지 않는다. 다시 필요하면 원래 거래를 새로 기록한다.
-            # (취소와 재취소가 얽힌 이력보다 읽기 쉽다)
-            raise AlreadyReversedError(f"역분개 {target.entry_id}는 취소할 수 없다")
-        if target.entry_id in self._reversed:
-            raise AlreadyReversedError(f"분개 {target.entry_id}는 이미 취소됐다")
 
     # --- 조회 ---
 
