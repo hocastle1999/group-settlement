@@ -143,3 +143,48 @@ def test_allocate_is_deterministic_regardless_of_input_order(total, weights, dat
     shuffled = {k: weights[k] for k in shuffled_keys}
     money = Money.from_minor(total, "KRW")
     assert allocate(money, weights) == allocate(money, shuffled)
+
+
+# --- 남는 단위의 출발점 돌리기 (5단계) ---
+
+
+def test_rotation_moves_who_pays_the_leftover():
+    split = EqualSplit(["a", "b", "c"])
+    payers = [
+        next(m for m, v in split.shares(krw(10_000), rotation=r).items() if v == krw(3_334))
+        for r in range(4)
+    ]
+    assert payers == ["a", "b", "c", "a"]  # 0번째부터 돌고 n마다 반복
+
+
+@given(
+    total=st.integers(1, 10**9),
+    members=st.sets(member_ids, min_size=1, max_size=10),
+    data=st.data(),
+)
+def test_rotation_spreads_leftover_evenly_over_a_cycle(total, members, data):
+    """균등 분할을 rotation 0..n-1로 n번 하면, 남는 단위를 모두가 정확히 같은 횟수만큼 받는다."""
+    members = sorted(members)
+    n = len(members)
+    leftover = total % n
+    received = {m: 0 for m in members}
+    for r in range(n):
+        shares = allocate(Money.from_minor(total, "KRW"), {m: 1 for m in members}, r)
+        for m, share in shares.items():
+            received[m] += share.minor_units - total // n
+    assert set(received.values()) == {leftover}
+    rotation = data.draw(st.integers(-(10**6), 10**6))
+    money = Money.from_minor(total, "KRW")
+    weights = {m: 1 for m in members}
+    assert allocate(money, weights, rotation) == allocate(money, weights, rotation + n)
+
+
+@given(total=st.integers(-(10**12), 10**12), weights=weights_st, rotation=st.integers(0, 10**6))
+def test_allocate_with_rotation_keeps_sum_and_bounds(total, weights, rotation):
+    money = Money.from_minor(total, "KRW")
+    shares = allocate(money, weights, rotation)
+    assert sum_money(list(shares.values()), money.currency) == money
+    weight_sum = sum(weights.values())
+    for member, share in shares.items():
+        exact = Fraction(abs(total) * weights[member], weight_sum)
+        assert exact - 1 < abs(share.minor_units) < exact + 1

@@ -40,7 +40,7 @@ def make_group(db: Engine, token: bytes) -> tuple[Group, list[str]]:
 
 def post_transfer(db: Engine, group: Group, ids: list[str], key: str, amount: int = 100):
     entry = transfer_entry(ids[0], ids[1], Money.of(amount, KRW))
-    return store.post_entry(db, group, lambda _c: entry, key, store.hash_bytes(key.encode()))
+    return store.post_entry(db, group, lambda _c, _s: entry, key, store.hash_bytes(key.encode()))
 
 
 def run_in_thread(fn) -> tuple[threading.Thread, list]:
@@ -215,7 +215,7 @@ def test_mixed_concurrent_operations_keep_every_invariant(db):
                 else RatioSplit({p: rng.randint(1, 4) for p in people})
             )
             e = expense_entry(people[0], amount, split)
-        store.post_entry(db, group, lambda _c: e, key, store.hash_bytes(key.encode()))
+        store.post_entry(db, group, lambda _c, _s: e, key, store.hash_bytes(key.encode()))
 
     def writer(t: int) -> None:
         rng = random.Random(t)

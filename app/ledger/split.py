@@ -9,6 +9,9 @@
 - 각자의 몫 = 전체 x 가중치 / 가중치 합 을 내림한다.
 - 남은 단위는 내림으로 잃은 소수 부분이 큰 사람부터 1단위씩 준다.
 - 소수 부분이 같으면 멤버 ID 순서로 준다. 입력 순서와 상관없이 결과가 같아야 하기 때문이다(결정성).
+- 다만 ID 순서의 출발점을 `rotation`만큼 돌린다. 출발점이 늘 같으면 균등 분할의 남는 1원을 매번 같은
+  사람이 낸다. DB는 분개 순번(seq)을 넘겨, 지출이 쌓이면 남는 단위가 멤버들에게 돌아가며 간다.
+  같은 입력 + 같은 rotation이면 결과는 같다(결정성 유지).
 """
 
 from __future__ import annotations
@@ -23,10 +26,13 @@ from app.ledger.money import Money, sum_money
 MemberId = str
 
 
-def allocate(total: Money, weights: Mapping[MemberId, int]) -> dict[MemberId, Money]:
+def allocate(
+    total: Money, weights: Mapping[MemberId, int], rotation: int = 0
+) -> dict[MemberId, Money]:
     """`total`을 정수 가중치 비율로 나눈다. 결과의 합은 정확히 `total`이다.
 
-    가중치가 0인 멤버도 결과에 0으로 들어간다.
+    가중치가 0인 멤버도 결과에 0으로 들어간다. `rotation`은 나머지가 같을 때의 순서를 정하는
+    출발점이다(ID 순서에서 rotation번째 멤버부터). 0이면 ID 순서 그대로.
     """
     if not weights:
         raise InvalidSplitError("나눌 대상이 없다")
@@ -54,8 +60,10 @@ def allocate(total: Money, weights: Mapping[MemberId, int]) -> dict[MemberId, Mo
         remainders[m] = r
 
     leftover = units - sum(base.values())
-    # 나머지가 큰 순서, 같으면 ID 순서. sorted는 안정 정렬이고 members가 이미 ID 순이다.
-    order = sorted(members, key=lambda m: -remainders[m])
+    # 나머지가 큰 순서, 같으면 ID 순서를 rotation만큼 돌린 순서.
+    n = len(members)
+    position = {m: (i - rotation) % n for i, m in enumerate(members)}
+    order = sorted(members, key=lambda m: (-remainders[m], position[m]))
     for m in order[:leftover]:
         base[m] += 1
 
@@ -66,8 +74,8 @@ class SplitRule(ABC):
     """지출 하나를 누가 얼마나 부담하는지 정하는 규칙."""
 
     @abstractmethod
-    def shares(self, total: Money) -> dict[MemberId, Money]:
-        """멤버별 부담액. 합은 반드시 `total`과 같다."""
+    def shares(self, total: Money, rotation: int = 0) -> dict[MemberId, Money]:
+        """멤버별 부담액. 합은 반드시 `total`과 같다. `rotation`은 `allocate` 참고."""
 
     @abstractmethod
     def members(self) -> frozenset[MemberId]:
@@ -88,8 +96,8 @@ class EqualSplit(SplitRule):
             raise InvalidSplitError("참여자가 없다")
         object.__setattr__(self, "participants", unique)
 
-    def shares(self, total: Money) -> dict[MemberId, Money]:
-        return allocate(total, {m: 1 for m in self.participants})
+    def shares(self, total: Money, rotation: int = 0) -> dict[MemberId, Money]:
+        return allocate(total, {m: 1 for m in self.participants}, rotation)
 
     def members(self) -> frozenset[MemberId]:
         return self.participants
@@ -117,8 +125,8 @@ class RatioSplit(SplitRule):
         if sum(weights.values()) == 0:
             raise InvalidSplitError("가중치 합이 0이다")
 
-    def shares(self, total: Money) -> dict[MemberId, Money]:
-        return allocate(total, self.weights)
+    def shares(self, total: Money, rotation: int = 0) -> dict[MemberId, Money]:
+        return allocate(total, self.weights, rotation)
 
     def members(self) -> frozenset[MemberId]:
         return frozenset(self.weights)
@@ -142,7 +150,8 @@ class FixedSplit(SplitRule):
             if amount.is_negative():
                 raise InvalidSplitError(f"부담액은 음수일 수 없다: {member}={amount}")
 
-    def shares(self, total: Money) -> dict[MemberId, Money]:
+    def shares(self, total: Money, rotation: int = 0) -> dict[MemberId, Money]:
+        # 각자 금액을 정했으므로 남는 단위가 없다. rotation은 쓰지 않는다.
         for member, amount in self.amounts.items():
             if amount.currency != total.currency:
                 raise InvalidSplitError(f"통화가 다르다: {member}={amount}, 총액 {total}")

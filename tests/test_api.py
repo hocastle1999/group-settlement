@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import event, select
@@ -46,34 +47,41 @@ def balances(client, gid, headers):
 # ---------------------------------------------------------------- 전체 흐름
 
 
+def leftover_taker(ids: dict[str, int], seq: int, count: int = 1) -> set[str]:
+    """균등 분할에서 남는 단위를 받는 멤버 이름.
+
+    규칙(app/ledger/split.py): 멤버 ID를 "문자열로" 정렬한 순서에서 분개 순번(seq)번째부터 차례로.
+    id 자릿수가 바뀌면("99" -> "100") 문자열 순서가 생성 순서와 달라지므로
+    이름을 하드코딩하지 않는다.
+    """
+    order = sorted(ids, key=lambda name: str(ids[name]))
+    return {order[(seq + k) % len(order)] for k in range(count)}
+
+
 def test_full_flow_expense_settle_transfer_reverse(client):
     gid, headers, ids = create_group(client)
 
     res = write(client, f"/api/groups/{gid}/expenses", headers, expense(ids, amount="10000"))
     assert res.status_code == 201, res.text
     first = res.json()
-    assert first["kind"] == "EXPENSE"
-    # 10,000원 / 3명: 나머지 1원까지 정확히 배분
-    assert sorted(ln["amount"] for ln in first["lines"] if ln["side"] == "DEBIT") == [
-        "3333",
-        "3333",
-        "3334",
-    ]
-    # 남는 1원은 멤버 ID 순서로: 가장 먼저 만든 민수가 3,334원을 부담한다
-    mine = next(
-        ln for ln in first["lines"] if ln["side"] == "DEBIT" and ln["member_id"] == ids["민수"]
-    )
-    assert mine["amount"] == "3334"
-    assert balances(client, gid, headers) == {"민수": "6666", "지영": "-3333", "현우": "-3333"}
+    assert (first["kind"], first["seq"]) == ("EXPENSE", 1)
+    # 10,000원 / 3명 = 3,334 + 3,333 + 3,333. 남는 1원은 순번 1만큼 돌린 출발점의 멤버
+    share = {name: 3333 for name in ids}
+    (extra,) = leftover_taker(ids, seq=1)
+    share[extra] = 3334
+    debit = {ln["member_id"]: ln["amount"] for ln in first["lines"] if ln["side"] == "DEBIT"}
+    assert debit == {ids[name]: str(v) for name, v in share.items()}
+    expected = {name: -v for name, v in share.items()}
+    expected["민수"] += 10_000
+    assert balances(client, gid, headers) == {k: str(v) for k, v in expected.items()}
 
     res = client.get(f"/api/groups/{gid}/settlement", headers=headers)
     plan = res.json()
     assert plan["strategy"] == "auto"
-    # 지영과 현우가 각자 3,333원을 민수에게: 송금 2번
-    assert sorted((t["sender_id"], t["receiver_id"], t["amount"]) for t in plan["transfers"]) == [
-        (ids["지영"], ids["민수"], "3333"),
-        (ids["현우"], ids["민수"], "3333"),
-    ]
+    # 지영과 현우가 각자 몫을 민수에게: 송금 2번
+    assert sorted(
+        (t["sender_id"], t["receiver_id"], t["amount"]) for t in plan["transfers"]
+    ) == sorted((ids[name], ids["민수"], str(share[name])) for name in ("지영", "현우"))
 
     # 정산 계획대로 송금하면 모두 0
     for t in plan["transfers"]:
@@ -82,11 +90,23 @@ def test_full_flow_expense_settle_transfer_reverse(client):
     assert set(balances(client, gid, headers).values()) == {"0"}
     assert client.get(f"/api/groups/{gid}/settlement", headers=headers).json()["transfers"] == []
 
-    # 첫 지출을 취소하면 송금만 남는다
+    # 첫 지출을 취소하면 송금만 남는다 (지출 효과의 정반대)
     res = write(client, f"/api/groups/{gid}/entries/{first['id']}/reversal", headers, {"memo": "x"})
     assert res.status_code == 201, res.text
     assert res.json()["reverses_entry_id"] == first["id"]
-    assert balances(client, gid, headers) == {"민수": "-6666", "지영": "3333", "현우": "3333"}
+    assert balances(client, gid, headers) == {k: str(-v) for k, v in expected.items()}
+
+
+def test_leftover_unit_rotates_between_members(client):
+    """10,000원을 3명이 나누는 지출 3번: 남는 1원을 세 사람이 한 번씩 낸다."""
+    gid, headers, ids = create_group(client)
+    paid = {member_id: 0 for member_id in ids.values()}
+    for _ in range(3):
+        entry = write(client, f"/api/groups/{gid}/expenses", headers, expense(ids, amount="10000"))
+        for ln in entry.json()["lines"]:
+            if ln["side"] == "DEBIT":
+                paid[ln["member_id"]] += int(ln["amount"])
+    assert set(paid.values()) == {10_000}  # 3,334 + 3,333 + 3,333씩
 
 
 def test_group_info_and_token_is_shown_only_at_creation(client, db):
@@ -132,8 +152,12 @@ def test_usd_keeps_cents(client):
     gid, headers, ids = create_group(client, currency="USD", members=("a", "b", "c"))
     res = write(client, f"/api/groups/{gid}/expenses", headers, expense(ids, "a", "10.00"))
     assert res.status_code == 201, res.text
-    # 10.00 / 3 = 3.34 + 3.33 + 3.33 (남는 1센트는 ID가 가장 작은 a)
-    assert balances(client, gid, headers) == {"a": "6.66", "b": "-3.33", "c": "-3.33"}
+    # 10.00 / 3 = 3.34 + 3.33 + 3.33 (남는 1센트는 순번 1만큼 돌린 출발점의 멤버)
+    (extra,) = leftover_taker(ids, seq=1)
+    share = {name: Decimal("3.34") if name == extra else Decimal("3.33") for name in ids}
+    expected = {name: -v for name, v in share.items()}
+    expected["a"] += Decimal("10.00")
+    assert balances(client, gid, headers) == {k: str(v) for k, v in expected.items()}
 
 
 def test_entries_are_listed_newest_first_with_cursor(client):

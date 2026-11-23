@@ -179,8 +179,11 @@ def get_members(engine: Engine, group_id: int) -> list[Member]:
 
 # ---------------------------------------------------------------- 분개 쓰기
 
-# 분개를 만드는 함수. 연결을 받는 이유: 역분개는 원래 분개를 DB에서 읽어야 만들 수 있다.
-EntryBuilder = Callable[[Connection], JournalEntry]
+# 분개를 만드는 함수 build(conn, seq).
+# - conn: 역분개는 원래 분개를 DB에서 읽어야 만들 수 있다.
+# - seq: 이 분개가 받을 순번. 분할에서 남는 단위를 받을 출발점(rotation)으로 쓴다.
+#   그룹 잠금 안에서 불리므로 이 순번은 확정된 값이다.
+EntryBuilder = Callable[[Connection, int], JournalEntry]
 
 
 def post_entry(
@@ -211,8 +214,8 @@ def post_entry(
             replay = _find_replay(conn, group.id, idempotency_key, request_hash)
             if replay is not None:
                 return replay
-            entry = build(conn)
             seq = last_seq + 1
+            entry = build(conn, seq)
             entry_id = _insert_checked(conn, group, entry, seq)
             conn.execute(
                 update(settlement_groups)
@@ -354,7 +357,7 @@ def load_posted(conn: Connection, group: Group, entry_id: int) -> PostedEntry:
 
 
 def reversal_builder(group: Group, entry_id: int, memo: str) -> EntryBuilder:
-    def build(conn: Connection) -> JournalEntry:
+    def build(conn: Connection, _seq: int) -> JournalEntry:
         return reversal_of(load_posted(conn, group, entry_id), memo)
 
     return build

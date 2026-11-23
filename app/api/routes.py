@@ -92,11 +92,11 @@ def record_expense(
     key = _require_key(idempotency_key)
     currency = group.currency
 
-    def build(_conn):
+    def build(_conn, seq: int):
         total = Money.of(body.amount, currency)
-        return expense_entry(
-            member_key(body.payer_id), total, _split_rule(body.split, group), body.memo
-        )
+        split = _split_rule(body.split, group)
+        # 남는 단위를 받을 출발점을 분개 순번만큼 돌린다 (한 사람에게 몰리지 않게)
+        return expense_entry(member_key(body.payer_id), total, split, body.memo, rotation=seq)
 
     result = store.post_entry(engine, group, build, key, _request_hash(request, body))
     return _entry_response(result, response)
@@ -117,7 +117,7 @@ def record_transfer(
 ) -> s.EntryOut:
     key = _require_key(idempotency_key)
 
-    def build(_conn):
+    def build(_conn, _seq):
         return transfer_entry(
             member_key(body.sender_id),
             member_key(body.receiver_id),

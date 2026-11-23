@@ -150,7 +150,7 @@ def test_confirm_waits_for_inflight_expense_and_then_is_stale(db):
     group = store.create_group(db, "모임", krw, store.hash_bytes(b"race"))
     ids = [member_key(store.add_member(db, group.id, n).id) for n in ("a", "b")]
 
-    def entry(_conn):
+    def entry(_conn, _seq):
         return expense_entry(ids[0], Money.of(1000, krw), EqualSplit(ids))
 
     store.post_entry(db, group, entry, "first", store.hash_bytes(b"1"))
@@ -159,10 +159,10 @@ def test_confirm_waits_for_inflight_expense_and_then_is_stale(db):
     inside = threading.Event()
     release = threading.Event()
 
-    def slow_entry(conn):
+    def slow_entry(conn, seq):
         inside.set()  # 잠금을 잡은 상태
         release.wait(timeout=10)
-        return entry(conn)
+        return entry(conn, seq)
 
     writer = threading.Thread(
         target=store.post_entry, args=(db, group, slow_entry, "second", store.hash_bytes(b"2"))

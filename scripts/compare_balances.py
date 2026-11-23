@@ -418,7 +418,9 @@ def starve_once(engine: Engine, writers: int, seconds: float, gap_ms: int) -> st
             a, b = rng.sample(ids, 2)
             e = transfer_entry(a, b, Money.of(rng.randint(1, 1000), KRW))
             key = f"{t}-{i}"
-            store.post_entry(engine, group, lambda _c, e=e: e, key, store.hash_bytes(key.encode()))
+            store.post_entry(
+                engine, group, lambda _c, _s, e=e: e, key, store.hash_bytes(key.encode())
+            )
             i += 1
             if gap_ms:
                 time.sleep(gap_ms / 1000)

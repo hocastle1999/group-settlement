@@ -58,7 +58,7 @@ _keys = iter(range(1, 1_000_000))
 def post(db: Engine, group: Group, entry, key: str | None = None):
     """도우미: 고정된 분개를 새 멱등성 키로 기록한다."""
     key = key or f"k{next(_keys)}"
-    return store.post_entry(db, group, lambda _c: entry, key, store.hash_bytes(key.encode()))
+    return store.post_entry(db, group, lambda _c, _s: entry, key, store.hash_bytes(key.encode()))
 
 
 def reverse(db: Engine, group: Group, entry_id: int, key: str | None = None):
@@ -311,9 +311,9 @@ def test_same_key_returns_first_entry_without_writing(db):
 def test_same_key_with_different_request_is_rejected(db):
     group, ids = make_group(db)
     entry = transfer_entry(m(ids, "a"), m(ids, "b"), krw(1_000))
-    store.post_entry(db, group, lambda _c: entry, "k", store.hash_bytes(b"request-1"))
+    store.post_entry(db, group, lambda _c, _s: entry, "k", store.hash_bytes(b"request-1"))
     with pytest.raises(IdempotencyKeyReusedError):
-        store.post_entry(db, group, lambda _c: entry, "k", store.hash_bytes(b"request-2"))
+        store.post_entry(db, group, lambda _c, _s: entry, "k", store.hash_bytes(b"request-2"))
 
 
 def test_keys_are_scoped_per_group_and_case_sensitive(db):
@@ -339,7 +339,7 @@ def test_concurrent_requests_with_same_key_create_one_entry(db):
     results, errors = [], []
     built = []
 
-    def build(_conn):
+    def build(_conn, _seq):
         built.append(1)
         time.sleep(0.3)  # 다른 요청들이 빠른 확인을 지나 잠금에서 기다리게 한다
         return entry

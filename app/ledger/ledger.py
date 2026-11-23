@@ -118,14 +118,17 @@ class PostedEntry:
 # --- 분개를 만드는 함수 ---
 
 
-def expense_entry(payer: MemberId, total: Money, split: SplitRule, memo: str = "") -> JournalEntry:
+def expense_entry(
+    payer: MemberId, total: Money, split: SplitRule, memo: str = "", rotation: int = 0
+) -> JournalEntry:
     """`payer`가 `total`을 먼저 내고 `split` 규칙으로 나눈 지출.
 
     부담액이 0인 멤버(예: 2원을 3명이 나눔, 가중치 0)는 줄을 만들지 않는다.
+    `rotation`은 남는 단위를 받을 순서의 출발점(`allocate` 참고). DB는 분개 순번을 넘긴다.
     """
     if not total.is_positive():
         raise InvalidAmountError(f"지출 금액은 양수여야 한다: {total}")
-    shares = split.shares(total)
+    shares = split.shares(total, rotation)
     lines = [Line(payer, Side.CREDIT, total)]
     lines += [Line(m, Side.DEBIT, amount) for m, amount in shares.items() if amount.is_positive()]
     return JournalEntry(EntryKind.EXPENSE, tuple(lines), memo)
