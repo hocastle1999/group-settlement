@@ -1,7 +1,8 @@
 # 배포 (7단계: 준비 완료, 실제 배포는 보류)
 
 저장소에 있는 것: `render.yaml`(Render Blueprint), 배포용 설정(TLS, 연결 풀, 빈도 제한, 프록시 수), CI의 서버 기동 스모크 테스트.
-아직 하지 않은 것: GitHub 저장소 만들기와 push, MySQL 만들기, Render 서비스 만들기. 모두 사용자 계정과 결정이 필요하다.
+한 것: 공개 저장소 github.com/hocastle1999/group-settlement에 push, GitHub CI 통과(MySQL 8.0 테스트, `alembic check`, 스모크 테스트).
+아직 하지 않은 것: MySQL 만들기, Render 서비스 만들기. 모두 사용자 계정과 결정이 필요하다.
 
 ## 구성
 
@@ -30,7 +31,7 @@ Render는 관리형 MySQL을 제공하지 않는다(PostgreSQL만). 후보:
 
 ## 사용자가 할 일 (순서)
 
-1. **GitHub 저장소 만들기와 push** — 요청하면 진행한다(먼저 묻는다). CI가 MySQL 서비스 컨테이너로 전체 테스트, `alembic check`, 스모크 테스트를 돌린다.
+1. ~~GitHub 저장소 만들기와 push~~ — 완료(공개 저장소, CI 통과). 이후 push는 먼저 묻는다.
 2. **MySQL 만들기**
    - DB `group_settlement`(utf8mb4), 앱 전용 사용자(그 DB 권한만). 관리자 계정을 앱에 쓰지 않는다.
    - 접속 정보(호스트, 포트, 사용자, 비밀번호)는 Render 대시보드에만 넣는다. 저장소, 문서, 채팅에 남기지 않는다.

@@ -10,9 +10,9 @@
   - 기능 단위로 작게 나눠 진행하고 커밋도 그 단위로 나눈다 (한국어 conventional commit).
 - 실제로 겪은 문제는 `docs/troubleshooting.md`에 문제, 원인, 해결, 배운 점으로 남긴다.
 - 설계 결정은 `docs/design.md`, 실험 결과는 `docs/experiments.md`에 남긴다.
-- 진행 단계는 README "로드맵"을 따른다. 현재 6단계 완료, 7단계(배포)는 준비까지 완료(`render.yaml`, docs/deploy.md). 실제 배포(GitHub 저장소, MySQL, Render 전용 워크스페이스)는 사용자가 보류했다.
+- 진행 단계는 README "로드맵"을 따른다. 현재 6단계 완료, 7단계(배포)는 준비까지 완료(`render.yaml`, docs/deploy.md). 공개 저장소 github.com/hocastle1999/group-settlement에 push했고 GitHub CI가 통과한다. 실제 배포(외부 MySQL, Render 전용 워크스페이스)는 사용자가 보류했다.
 - 범위 결정: 인증은 그룹별 초대 링크 토큰(회원가입 없음), 화면은 REST API + 데모 한 페이지. 다중 통화는 "지출 시점 환율로 기준 통화에 환산, 원장은 통화 하나"(5단계).
-- GitHub 저장소 생성과 push는 사용자에게 먼저 묻는다.
+- push와 저장소 설정 변경은 사용자에게 먼저 묻는다.
 - 사용자와의 대화와 문서는 한국어로 작성한다. 코드 식별자는 영어, 주석은 한국어로 쓴다.
 
 ## 기술 스택
